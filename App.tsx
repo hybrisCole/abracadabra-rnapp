@@ -862,9 +862,6 @@ function AbracadabraScreen(): React.JSX.Element {
                 textTransform="uppercase">
                 Recording timeline
               </Heading>
-              <Text mt="$2" fontSize="$xs" color="$coolGray400" lineHeight="$sm">
-                Downsampled curves vs capture order (sorted by MCU timestamp). Raw accelerometer and gyroscope axes plus ‖accel‖.
-              </Text>
               <Box mt="$3">
                 <RecordingTimelineCharts
                   samples={lastRecording.samples}

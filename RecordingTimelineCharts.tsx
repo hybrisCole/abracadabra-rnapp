@@ -1,15 +1,19 @@
 /**
- * Timeline strip + multi-series SVG charts for IMU recording (accel, gyro, ‖a‖).
+ * Timeline strip + tabbed SVG charts (Gluestack Tabs) for IMU recording.
  */
 
 import React, {useMemo} from 'react';
-import {
-  Dimensions,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import {Dimensions, StyleSheet, Text, View} from 'react-native';
 import Svg, {Line, Polyline, Rect} from 'react-native-svg';
+
+import {
+  Tabs,
+  TabsTab,
+  TabsTabList,
+  TabsTabPanel,
+  TabsTabPanels,
+  TabsTabTitle,
+} from '@gluestack-ui/themed';
 
 import type {ImuSample} from './bleRecordingProtocol';
 
@@ -28,9 +32,18 @@ const COLORS = {
   gy: '#f472b6',
   gz: '#bef264',
   mag: '#00f5ff',
+  gyroMag: '#f472b6',
   grid: 'rgba(148, 163, 184, 0.22)',
   axis: 'rgba(148, 163, 184, 0.45)',
 } as const;
+
+/** Gluestack Tabs passes this shape via Tab children render prop (types still reflect Pressable). */
+type TabSlotState = {
+  active: boolean;
+  hovered: boolean;
+  pressed: boolean;
+  focused: boolean;
+};
 
 function downsampleIndices(length: number, maxPoints: number): number[] {
   if (length === 0) {
@@ -44,6 +57,20 @@ function downsampleIndices(length: number, maxPoints: number): number[] {
     idx.push(Math.min(length - 1, Math.floor((k / (maxPoints - 1)) * (length - 1))));
   }
   return idx;
+}
+
+function normalizeMinMax(values: number[]): number[] {
+  if (values.length === 0) {
+    return [];
+  }
+  let mn = Infinity;
+  let mx = -Infinity;
+  for (const v of values) {
+    mn = Math.min(mn, v);
+    mx = Math.max(mx, v);
+  }
+  const sp = Math.max(mx - mn, 1e-6);
+  return values.map(v => (v - mn) / sp);
 }
 
 function polylinePointsShared(
@@ -71,10 +98,11 @@ function polylinePointsShared(
 
 type PanelProps = {
   title: string;
+  subtitle?: string;
   series: {label: string; color: string; values: number[]}[];
 };
 
-function ChartPanel({title, series}: PanelProps): React.JSX.Element {
+function ChartPanel({title, subtitle, series}: PanelProps): React.JSX.Element {
   let vmin = Infinity;
   let vmax = -Infinity;
   for (const s of series) {
@@ -94,6 +122,7 @@ function ChartPanel({title, series}: PanelProps): React.JSX.Element {
   return (
     <View style={styles.panel}>
       <Text style={styles.panelTitle}>{title}</Text>
+      {subtitle ? <Text style={styles.panelSubtitle}>{subtitle}</Text> : null}
       <View style={styles.legendRow}>
         {series.map(s => (
           <View key={s.label} style={styles.legendItem}>
@@ -205,6 +234,13 @@ export function RecordingTimelineCharts({
         Math.sqrt(s.ax * s.ax + s.ay * s.ay + s.az * s.az),
       ),
     );
+    const gyroMag = reorderByTime(
+      picked.map(s =>
+        Math.sqrt(s.gx * s.gx + s.gy * s.gy + s.gz * s.gz),
+      ),
+    );
+    const magNorm = normalizeMinMax(mag);
+    const gyroMagNorm = normalizeMinMax(gyroMag);
 
     return {
       tMin,
@@ -216,6 +252,9 @@ export function RecordingTimelineCharts({
       gy,
       gz,
       mag,
+      gyroMag,
+      magNorm,
+      gyroMagNorm,
     };
   }, [samples]);
 
@@ -227,10 +266,173 @@ export function RecordingTimelineCharts({
     );
   }
 
-  const {tMin, tMax, ax, ay, az, gx, gy, gz, mag} = prepared;
+  const {
+    tMin,
+    tMax,
+    ax,
+    ay,
+    az,
+    gx,
+    gy,
+    gz,
+    mag,
+    gyroMag,
+    magNorm,
+    gyroMagNorm,
+  } = prepared;
+
+  const tabChromeProps = {
+    px: '$2',
+    py: '$2',
+    mr: '$1',
+    mb: '$1',
+    borderRadius: '$md',
+    borderWidth: 1,
+    borderColor: 'rgba(34,211,238,0.28)',
+    bg: 'rgba(15,23,42,0.65)',
+  } as const;
 
   return (
     <View style={styles.wrap}>
+      <Tabs value="acc">
+        <TabsTabList
+          variant="scrollable"
+          flexWrap="wrap"
+          alignItems="center"
+          py="$2"
+          px="$1"
+          mb="$2"
+          borderRadius="$xl"
+          borderWidth={1}
+          borderColor="rgba(34,211,238,0.22)"
+          bg="rgba(2,6,23,0.72)">
+          <TabsTab value="acc" {...tabChromeProps}>
+            {state => {
+              const s = state as unknown as TabSlotState;
+              return (
+              <TabsTabTitle
+                fontSize={10}
+                fontFamily="Menlo"
+                fontWeight="$extrabold"
+                letterSpacing="$sm"
+                color={s.active ? '#22d3ee' : '#64748b'}>
+                ACC RAW
+              </TabsTabTitle>
+              );
+            }}
+          </TabsTab>
+          <TabsTab value="gyro" {...tabChromeProps}>
+            {state => {
+              const s = state as unknown as TabSlotState;
+              return (
+              <TabsTabTitle
+                fontSize={10}
+                fontFamily="Menlo"
+                fontWeight="$extrabold"
+                letterSpacing="$sm"
+                color={s.active ? '#f472b6' : '#64748b'}>
+                GYRO RAW
+              </TabsTabTitle>
+              );
+            }}
+          </TabsTab>
+          <TabsTab value="accMag" {...tabChromeProps}>
+            {state => {
+              const s = state as unknown as TabSlotState;
+              return (
+              <TabsTabTitle
+                fontSize={10}
+                fontFamily="Menlo"
+                fontWeight="$extrabold"
+                letterSpacing="$sm"
+                color={s.active ? '#00f5ff' : '#64748b'}>
+                ACC MAG
+              </TabsTabTitle>
+              );
+            }}
+          </TabsTab>
+          <TabsTab value="gyroMag" {...tabChromeProps}>
+            {state => {
+              const s = state as unknown as TabSlotState;
+              return (
+              <TabsTabTitle
+                fontSize={10}
+                fontFamily="Menlo"
+                fontWeight="$extrabold"
+                letterSpacing="$sm"
+                color={s.active ? '#f472b6' : '#64748b'}>
+                GYRO MAG
+              </TabsTabTitle>
+              );
+            }}
+          </TabsTab>
+          <TabsTab value="compare" {...tabChromeProps}>
+            {state => {
+              const s = state as unknown as TabSlotState;
+              return (
+              <TabsTabTitle
+                fontSize={10}
+                fontFamily="Menlo"
+                fontWeight="$extrabold"
+                letterSpacing="$sm"
+                color={s.active ? '#a3e635' : '#64748b'}>
+                COMPARE
+              </TabsTabTitle>
+              );
+            }}
+          </TabsTab>
+        </TabsTabList>
+
+        <TabsTabPanels>
+          <TabsTabPanel value="acc">
+            <ChartPanel
+              title="Accelerometer"
+              subtitle="Raw axes vs capture order (MCU time)."
+              series={[
+                {label: 'ax', color: COLORS.ax, values: ax},
+                {label: 'ay', color: COLORS.ay, values: ay},
+                {label: 'az', color: COLORS.az, values: az},
+              ]}
+            />
+          </TabsTabPanel>
+          <TabsTabPanel value="gyro">
+            <ChartPanel
+              title="Gyroscope"
+              subtitle="Raw axes vs capture order (MCU time)."
+              series={[
+                {label: 'gx', color: COLORS.gx, values: gx},
+                {label: 'gy', color: COLORS.gy, values: gy},
+                {label: 'gz', color: COLORS.gz, values: gz},
+              ]}
+            />
+          </TabsTabPanel>
+          <TabsTabPanel value="accMag">
+            <ChartPanel
+              title="Acceleration magnitude"
+              subtitle="‖a‖ = √(ax² + ay² + az²) in raw units."
+              series={[{label: '‖a‖', color: COLORS.mag, values: mag}]}
+            />
+          </TabsTabPanel>
+          <TabsTabPanel value="gyroMag">
+            <ChartPanel
+              title="Gyro magnitude"
+              subtitle="‖ω‖ = √(gx² + gy² + gz²) — rotational energy envelope."
+              series={[{label: '‖ω‖', color: COLORS.gyroMag, values: gyroMag}]}
+            />
+          </TabsTabPanel>
+          <TabsTabPanel value="compare">
+            <ChartPanel
+              title="Normalized compare"
+              subtitle="Each series min–max scaled to 0…1 to compare shape (not absolute units)."
+              series={[
+                {label: '‖a‖ norm', color: COLORS.mag, values: magNorm},
+                {label: '‖ω‖ norm', color: COLORS.gyroMag, values: gyroMagNorm},
+              ]}
+            />
+          </TabsTabPanel>
+        </TabsTabPanels>
+      </Tabs>
+
       <View style={styles.timelineBar}>
         <View style={styles.timelineTrack}>
           <View style={styles.timelineGlow} />
@@ -241,27 +443,6 @@ export function RecordingTimelineCharts({
           <Text style={styles.tlab}>{tMax} ms</Text>
         </View>
       </View>
-
-      <ChartPanel
-        title="Accelerometer (raw)"
-        series={[
-          {label: 'ax', color: COLORS.ax, values: ax},
-          {label: 'ay', color: COLORS.ay, values: ay},
-          {label: 'az', color: COLORS.az, values: az},
-        ]}
-      />
-      <ChartPanel
-        title="Gyroscope (raw)"
-        series={[
-          {label: 'gx', color: COLORS.gx, values: gx},
-          {label: 'gy', color: COLORS.gy, values: gy},
-          {label: 'gz', color: COLORS.gz, values: gz},
-        ]}
-      />
-      <ChartPanel
-        title="Acceleration magnitude"
-        series={[{label: '‖a‖', color: COLORS.mag, values: mag}]}
-      />
 
       <Text style={styles.footer}>
         Recording #{windowId} · {samples.length} samples · Δt{' '}
@@ -277,7 +458,8 @@ const styles = StyleSheet.create({
     gap: 14,
   },
   timelineBar: {
-    marginBottom: 4,
+    marginTop: 10,
+    marginBottom: 2,
   },
   timelineTrack: {
     height: 6,
@@ -322,6 +504,12 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     letterSpacing: 1.2,
     textTransform: 'uppercase',
+  },
+  panelSubtitle: {
+    color: '#64748b',
+    fontSize: 10,
+    fontFamily: 'Menlo',
+    lineHeight: 14,
   },
   legendRow: {
     flexDirection: 'row',
