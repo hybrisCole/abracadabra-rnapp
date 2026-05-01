@@ -2,11 +2,14 @@
  * Timeline strip + tabbed SVG charts (Gluestack Tabs) for IMU recording.
  */
 
-import React, {useMemo} from 'react';
+import Slider from '@react-native-community/slider';
+import React, {useEffect, useMemo, useReducer} from 'react';
 import {Dimensions, StyleSheet, Text, View} from 'react-native';
 import Svg, {Line, Polyline, Rect} from 'react-native-svg';
 
 import {
+  Button,
+  ButtonText,
   Tabs,
   TabsTab,
   TabsTabList,
@@ -44,6 +47,62 @@ type TabSlotState = {
   pressed: boolean;
   focused: boolean;
 };
+
+type CropMsRange = {start: number; end: number};
+
+type CropAction =
+  | {type: 'reset'; tMin: number; tMax: number}
+  | {type: 'setStart'; value: number; tMin: number; tMax: number}
+  | {type: 'setEnd'; value: number; tMin: number; tMax: number};
+
+function cropReducer(state: CropMsRange, action: CropAction): CropMsRange {
+  switch (action.type) {
+    case 'reset':
+      return {start: action.tMin, end: action.tMax};
+    case 'setStart': {
+      const {tMin: tm, tMax: tx} = action;
+      const span = Math.max(tx - tm, 1);
+      let start = Math.round(
+        Math.min(Math.max(action.value, tm), tx),
+      );
+      let end = state.end;
+      if (start > end) {
+        end = Math.min(start + Math.min(5, span), tx);
+        start = Math.min(start, end);
+      }
+      return {start, end};
+    }
+    case 'setEnd': {
+      const {tMin: tm, tMax: tx} = action;
+      let end = Math.round(
+        Math.min(Math.max(action.value, tm), tx),
+      );
+      let start = state.start;
+      if (end < start) {
+        start = Math.max(end - Math.min(5, Math.max(tx - tm, 1)), tm);
+        end = Math.max(end, start);
+      }
+      return {start, end};
+    }
+    default:
+      return state;
+  }
+}
+
+function cropOverlayGeom(
+  cropStart: number,
+  cropEnd: number,
+  tMin: number,
+  tMax: number,
+): {left: number; width: number} {
+  const span = Math.max(tMax - tMin, 1);
+  const innerW = CHART_W - PAD * 2;
+  const x1 = PAD + ((cropStart - tMin) / span) * innerW;
+  const x2 = PAD + ((cropEnd - tMin) / span) * innerW;
+  const left = Math.min(x1, x2);
+  const width = Math.max(Math.abs(x2 - x1), 2);
+  return {left, width};
+}
 
 function downsampleIndices(length: number, maxPoints: number): number[] {
   if (length === 0) {
@@ -100,9 +159,59 @@ type PanelProps = {
   title: string;
   subtitle?: string;
   series: {label: string; color: string; values: number[]}[];
+  /** MCU `t_ms` extent + crop; overlay drawn in chart pixel space (time-linear X). */
+  cropOverlay?: {tMin: number; tMax: number; cropStart: number; cropEnd: number};
 };
 
-function ChartPanel({title, subtitle, series}: PanelProps): React.JSX.Element {
+function ChartCropHighlight({
+  cropStart,
+  cropEnd,
+  tMin,
+  tMax,
+}: {
+  cropStart: number;
+  cropEnd: number;
+  tMin: number;
+  tMax: number;
+}): React.JSX.Element {
+  const {left, width} = cropOverlayGeom(cropStart, cropEnd, tMin, tMax);
+  const top = PAD;
+  const h = CHART_H - PAD * 2;
+  return (
+    <>
+      <Rect
+        x={left}
+        y={top}
+        width={width}
+        height={h}
+        fill="rgba(217,70,239,0.16)"
+        pointerEvents="none"
+      />
+      <Line
+        x1={left}
+        y1={top}
+        x2={left}
+        y2={top + h}
+        stroke="#00f5ff"
+        strokeWidth={1.25}
+        opacity={0.95}
+        pointerEvents="none"
+      />
+      <Line
+        x1={left + width}
+        y1={top}
+        x2={left + width}
+        y2={top + h}
+        stroke="#00f5ff"
+        strokeWidth={1.25}
+        opacity={0.95}
+        pointerEvents="none"
+      />
+    </>
+  );
+}
+
+function ChartPanel({title, subtitle, series, cropOverlay}: PanelProps): React.JSX.Element {
   let vmin = Infinity;
   let vmax = -Infinity;
   for (const s of series) {
@@ -164,6 +273,14 @@ function ChartPanel({title, subtitle, series}: PanelProps): React.JSX.Element {
           stroke={COLORS.axis}
           strokeWidth={1}
         />
+        {cropOverlay ? (
+          <ChartCropHighlight
+            cropStart={cropOverlay.cropStart}
+            cropEnd={cropOverlay.cropEnd}
+            tMin={cropOverlay.tMin}
+            tMax={cropOverlay.tMax}
+          />
+        ) : null}
         {series.map(s => {
           const points = polylinePointsShared(
             s.values,
@@ -202,6 +319,11 @@ export function RecordingTimelineCharts({
   samples: ImuSample[];
   windowId: number;
 }): React.JSX.Element {
+  const [crop, dispatchCrop] = useReducer(cropReducer, {
+    start: 0,
+    end: 1,
+  });
+
   const prepared = useMemo(() => {
     if (samples.length === 0) {
       return null;
@@ -258,6 +380,20 @@ export function RecordingTimelineCharts({
     };
   }, [samples]);
 
+  const cropResetTMin = prepared?.tMin;
+  const cropResetTMax = prepared?.tMax;
+
+  useEffect(() => {
+    if (cropResetTMin == null || cropResetTMax == null) {
+      return;
+    }
+    dispatchCrop({
+      type: 'reset',
+      tMin: cropResetTMin,
+      tMax: cropResetTMax,
+    });
+  }, [cropResetTMin, cropResetTMax, windowId]);
+
   if (!prepared) {
     return (
       <View style={styles.empty}>
@@ -280,6 +416,38 @@ export function RecordingTimelineCharts({
     magNorm,
     gyroMagNorm,
   } = prepared;
+
+  const cropOverlayProps = {
+    tMin,
+    tMax,
+    cropStart: crop.start,
+    cropEnd: crop.end,
+  };
+
+  const logCropSelection = (): void => {
+    const lo = Math.min(crop.start, crop.end);
+    const hi = Math.max(crop.start, crop.end);
+    const cropped = samples.filter(s => s.t_ms >= lo && s.t_ms <= hi);
+    const summary = {
+      windowId,
+      cropStartMs: lo,
+      cropEndMs: hi,
+      durationMs: hi - lo,
+      samplesTotal: samples.length,
+      samplesInCrop: cropped.length,
+      tMsFirstInCrop: cropped[0]?.t_ms ?? null,
+      tMsLastInCrop: cropped[cropped.length - 1]?.t_ms ?? null,
+    };
+    console.log('[TimelineCrop]', JSON.stringify(summary, null, 2));
+    if (__DEV__ && cropped.length > 0) {
+      console.log('[TimelineCrop] first sample', cropped[0]);
+      console.log('[TimelineCrop] last sample', cropped[cropped.length - 1]);
+    }
+  };
+
+  const spanMs = Math.max(tMax - tMin, 1);
+  const selLeftPct = ((crop.start - tMin) / spanMs) * 100;
+  const selWidthPct = ((crop.end - crop.start) / spanMs) * 100;
 
   const tabChromeProps = {
     px: '$2',
@@ -388,6 +556,7 @@ export function RecordingTimelineCharts({
             <ChartPanel
               title="Accelerometer"
               subtitle="Raw axes vs capture order (MCU time)."
+              cropOverlay={cropOverlayProps}
               series={[
                 {label: 'ax', color: COLORS.ax, values: ax},
                 {label: 'ay', color: COLORS.ay, values: ay},
@@ -399,6 +568,7 @@ export function RecordingTimelineCharts({
             <ChartPanel
               title="Gyroscope"
               subtitle="Raw axes vs capture order (MCU time)."
+              cropOverlay={cropOverlayProps}
               series={[
                 {label: 'gx', color: COLORS.gx, values: gx},
                 {label: 'gy', color: COLORS.gy, values: gy},
@@ -410,6 +580,7 @@ export function RecordingTimelineCharts({
             <ChartPanel
               title="Acceleration magnitude"
               subtitle="‖a‖ = √(ax² + ay² + az²) in raw units."
+              cropOverlay={cropOverlayProps}
               series={[{label: '‖a‖', color: COLORS.mag, values: mag}]}
             />
           </TabsTabPanel>
@@ -417,6 +588,7 @@ export function RecordingTimelineCharts({
             <ChartPanel
               title="Gyro magnitude"
               subtitle="‖ω‖ = √(gx² + gy² + gz²) — rotational energy envelope."
+              cropOverlay={cropOverlayProps}
               series={[{label: '‖ω‖', color: COLORS.gyroMag, values: gyroMag}]}
             />
           </TabsTabPanel>
@@ -424,6 +596,7 @@ export function RecordingTimelineCharts({
             <ChartPanel
               title="Normalized compare"
               subtitle="Each series min–max scaled to 0…1 to compare shape (not absolute units)."
+              cropOverlay={cropOverlayProps}
               series={[
                 {label: '‖a‖ norm', color: COLORS.mag, values: magNorm},
                 {label: '‖ω‖ norm', color: COLORS.gyroMag, values: gyroMagNorm},
@@ -434,14 +607,78 @@ export function RecordingTimelineCharts({
       </Tabs>
 
       <View style={styles.timelineBar}>
-        <View style={styles.timelineTrack}>
-          <View style={styles.timelineGlow} />
+        <View style={styles.timelineTrackWrap}>
+          <View style={styles.timelineGlowBg} />
+          <View
+            style={[
+              styles.timelineCropBand,
+              {left: `${selLeftPct}%`, width: `${Math.max(selWidthPct, 0)}%`},
+            ]}
+          />
         </View>
         <View style={styles.timelineLabels}>
           <Text style={styles.tlab}>{tMin} ms</Text>
           <Text style={styles.tlabMuted}>window time →</Text>
           <Text style={styles.tlab}>{tMax} ms</Text>
         </View>
+      </View>
+
+      <View style={styles.cropSection}>
+        <Text style={styles.cropSectionTitle}>Crop timeline (t_ms)</Text>
+        <View style={styles.sliderRow}>
+          <Text style={styles.sliderLabel}>start</Text>
+          <Slider
+            key={`crop-start-${windowId}-${tMin}-${tMax}`}
+            style={styles.slider}
+            minimumValue={tMin}
+            maximumValue={tMax}
+            step={1}
+            value={crop.start}
+            onValueChange={v =>
+              dispatchCrop({type: 'setStart', value: v, tMin, tMax})
+            }
+            minimumTrackTintColor="rgba(34,211,238,0.55)"
+            maximumTrackTintColor="rgba(51,65,85,0.85)"
+            thumbTintColor="#22d3ee"
+          />
+          <Text style={styles.sliderValue}>{crop.start} ms</Text>
+        </View>
+        <View style={styles.sliderRow}>
+          <Text style={styles.sliderLabel}>end</Text>
+          <Slider
+            key={`crop-end-${windowId}-${tMin}-${tMax}`}
+            style={styles.slider}
+            minimumValue={tMin}
+            maximumValue={tMax}
+            step={1}
+            value={crop.end}
+            onValueChange={v =>
+              dispatchCrop({type: 'setEnd', value: v, tMin, tMax})
+            }
+            minimumTrackTintColor="rgba(244,114,182,0.55)"
+            maximumTrackTintColor="rgba(51,65,85,0.85)"
+            thumbTintColor="#f472b6"
+          />
+          <Text style={styles.sliderValue}>{crop.end} ms</Text>
+        </View>
+        <Button
+          size="sm"
+          mt="$2"
+          alignSelf="flex-start"
+          borderRadius="$lg"
+          bg="rgba(217,70,239,0.35)"
+          borderWidth={1}
+          borderColor="rgba(217,70,239,0.75)"
+          onPress={logCropSelection}>
+          <ButtonText
+            color="#f9a8d4"
+            fontWeight="$extrabold"
+            letterSpacing="$md"
+            fontSize="$xs"
+            textTransform="uppercase">
+            Crop · log selection
+          </ButtonText>
+        </Button>
       </View>
 
       <Text style={styles.footer}>
@@ -461,20 +698,74 @@ const styles = StyleSheet.create({
     marginTop: 10,
     marginBottom: 2,
   },
-  timelineTrack: {
-    height: 6,
-    borderRadius: 3,
-    backgroundColor: 'rgba(30,41,59,0.9)',
+  timelineTrackWrap: {
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: 'rgba(30,41,59,0.95)',
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: 'rgba(34,211,238,0.35)',
     overflow: 'hidden',
+    position: 'relative',
   },
-  timelineGlow: {
+  timelineGlowBg: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0,245,255,0.22)',
+  },
+  timelineCropBand: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(217,70,239,0.62)',
+    borderRadius: 3,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(0,245,255,0.55)',
+  },
+  cropSection: {
+    marginTop: 4,
+    paddingTop: 10,
+    paddingBottom: 4,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: 'rgba(34,211,238,0.18)',
+    gap: 8,
+  },
+  cropSectionTitle: {
+    color: '#94a3b8',
+    fontSize: 10,
+    fontFamily: 'Menlo',
+    fontWeight: '700',
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+  },
+  sliderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    width: CHART_W,
+    alignSelf: 'center',
+  },
+  sliderLabel: {
+    width: 40,
+    color: '#64748b',
+    fontSize: 10,
+    fontFamily: 'Menlo',
+    fontWeight: '700',
+    textTransform: 'uppercase',
+  },
+  slider: {
     flex: 1,
-    backgroundColor: 'rgba(0,245,255,0.35)',
-    shadowColor: '#00f5ff',
-    shadowOpacity: 0.9,
-    shadowRadius: 8,
+    height: 36,
+  },
+  sliderValue: {
+    width: 56,
+    color: '#67e8f9',
+    fontSize: 10,
+    fontFamily: 'Menlo',
+    fontWeight: '700',
+    textAlign: 'right',
   },
   timelineLabels: {
     flexDirection: 'row',
