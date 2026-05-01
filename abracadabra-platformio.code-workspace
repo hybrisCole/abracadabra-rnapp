@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "../abracadabra-platformio"
+		},
+		{
+			"path": "."
+		}
+	],
+	"settings": {}
+}
