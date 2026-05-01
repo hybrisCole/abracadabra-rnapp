@@ -5,7 +5,7 @@ This is a new [**React Native**](https://reactnative.dev) project, bootstrapped 
 This app uses [**react-native-ble-plx**](https://github.com/dotintent/react-native-ble-plx) to scan, **connect**, discover GATT, and **subscribe** to the wearable’s NOTIFY stream.
 
 - **iOS:** `ios/AbracadabraRnApp/Info.plist` includes `NSBluetoothAlwaysUsageDescription` and `NSBluetoothPeripheralUsageDescription`. After changing native deps: `cd ios && bundle exec pod install`.
-- **Flow:** Auto-scan for **`XA_Abracadabra`** → connect → discover → monitor **`ADAB0003-…`** on service **`ADAB0001-…`**. After an **accepted** double-tap recording on the MCU, the peripheral pushes **META → CHUNK\* → COMMIT** framed packets (`bleRecordingProtocol.ts`). Partial or CRC-failed transfers are **rolled back** (discarded). Samples render as a Skia **motion trail + energy ribbon** (`ImuMotionSkia.tsx`).
+- **Flow:** Auto-scan for **`XA_Abracadabra`** → connect → discover → monitor **`ADAB0003-…`** on service **`ADAB0001-…`**. After an **accepted** double-tap recording on the MCU, the peripheral pushes **META → CHUNK\* → COMMIT** framed packets (`bleRecordingProtocol.ts`). Partial or CRC-failed transfers are **rolled back** (discarded). Samples render as **SVG timeline charts** (accel / gyro / ‖a‖) in `RecordingTimelineCharts.tsx`.
 - **Reconnect:** After an unexpected disconnect, the app waits ~**1.8 s** and reconnects automatically (same peripheral id), up to **15** tries, then shows **Link Lost** until **Scan Again**.
 - **Android:** `requestMTU(247)` runs after connect when supported (larger chunks).
 

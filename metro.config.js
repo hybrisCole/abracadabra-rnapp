@@ -1,3 +1,4 @@
+const path = require('path');
 const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
 
 /**
@@ -6,6 +7,13 @@ const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
  *
  * @type {import('@react-native/metro-config').MetroConfig}
  */
-const config = {};
+const config = {
+  resolver: {
+    extraNodeModules: {
+      // @gluestack-ui/themed → react-aria expects `react-dom` (flushSync); RN has no react-dom.
+      'react-dom': path.resolve(__dirname, 'rn-shims/react-dom'),
+    },
+  },
+};
 
 module.exports = mergeConfig(getDefaultConfig(__dirname), config);

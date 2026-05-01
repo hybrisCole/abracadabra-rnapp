@@ -9,17 +9,30 @@ import {
   Animated,
   Easing,
   Platform,
-  ScrollView,
   StatusBar,
   StyleSheet,
-  Text,
-  TouchableOpacity,
   Vibration,
-  View,
 } from 'react-native';
 import type {Device, Subscription} from 'react-native-ble-plx';
 import {BleManager, State} from 'react-native-ble-plx';
-import {SafeAreaView} from 'react-native-safe-area-context';
+import {SafeAreaProvider, useSafeAreaInsets} from 'react-native-safe-area-context';
+import {
+  Alert,
+  AlertText,
+  Badge,
+  BadgeText,
+  Box,
+  Button,
+  ButtonText,
+  Divider,
+  GluestackUIProvider,
+  Heading,
+  HStack,
+  ScrollView,
+  Text,
+  VStack,
+} from '@gluestack-ui/themed';
+import {config} from '@gluestack-ui/config';
 import {
   BlurMask,
   Canvas,
@@ -38,7 +51,7 @@ import {
   RecordingAssembler,
   type DecodedRecording,
 } from './bleRecordingProtocol';
-import {ImuMotionSkia} from './ImuMotionSkia';
+import {RecordingTimelineCharts} from './RecordingTimelineCharts';
 
 const TARGET_BLE_NAME = 'XA_Abracadabra';
 const SCAN_DURATION_MS = 5000;
@@ -92,7 +105,7 @@ function NeonBackdrop({variant}: {variant: ScanOutcome}): React.JSX.Element {
   const secondary = variant === 'found' ? '#d946ef' : '#7c3aed';
 
   return (
-    <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+    <Box pointerEvents="none" position="absolute" top={0} right={0} bottom={0} left={0}>
       <Canvas style={StyleSheet.absoluteFill}>
         <Rect x={0} y={0} width={440} height={900}>
           <LinearGradient
@@ -113,8 +126,8 @@ function NeonBackdrop({variant}: {variant: ScanOutcome}): React.JSX.Element {
           </Circle>
         </Group>
       </Canvas>
-      <View style={styles.gridOverlay} />
-    </View>
+      <Box position="absolute" top={0} right={0} bottom={0} left={0} style={styles.gridOverlay} />
+    </Box>
   );
 }
 
@@ -163,7 +176,11 @@ function CyberOrb({
   const rStrokeInner = compact ? 36 : 58;
 
   return (
-    <View style={compact ? styles.orbFrameCompact : styles.orbFrame}>
+    <Box
+      alignItems="center"
+      justifyContent="center"
+      height={compact ? 148 : 230}
+      mb={compact ? -4 : undefined}>
       <Animated.View
         style={[
           compact ? styles.orbPulseCompact : styles.orbPulse,
@@ -196,11 +213,11 @@ function CyberOrb({
         ]}>
         {glyph}
       </Animated.Text>
-    </View>
+    </Box>
   );
 }
 
-function App(): React.JSX.Element {
+function AbracadabraScreen(): React.JSX.Element {
   const managerRef = useRef<BleManager | null>(null);
   const scanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pulse = useRef(new Animated.Value(0)).current;
@@ -231,6 +248,8 @@ function App(): React.JSX.Element {
   const [scanning, setScanning] = useState(false);
   const [bleState, setBleState] = useState<State>(State.Unknown);
   const [hasScanned, setHasScanned] = useState(false);
+
+  const insets = useSafeAreaInsets();
 
   useEffect(() => {
     const mgr = new BleManager();
@@ -373,6 +392,7 @@ function App(): React.JSX.Element {
     }
 
     let cancelled = false;
+    const assemblerForCleanup = assemblerRef.current;
     assemblerRef.current.reset();
     setConnPhase('connecting');
     setTransferNote(null);
@@ -380,6 +400,7 @@ function App(): React.JSX.Element {
     let monitorSub: Subscription | null = null;
     let disconnectSub: Subscription | null = null;
 
+    // eslint-disable-next-line no-void -- async connect; cancellation via `cancelled`
     void (async () => {
       try {
         const dev = await mgr.connectToDevice(targetDevice.id, {
@@ -529,11 +550,15 @@ function App(): React.JSX.Element {
       bleMonitorSubRef.current = null;
       const d = connectedDevRef.current;
       connectedDevRef.current = null;
-      assemblerRef.current.reset('effect cleanup');
-      void d?.cancelConnection();
+      assemblerForCleanup.reset('effect cleanup');
+      if (d != null) {
+        d.cancelConnection().catch(() => {});
+      }
       setRecvProgress(null);
       setConnPhase('off');
     };
+    // Re-run session only when peripheral id / radio / link generation changes (not DeviceRow churn).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targetDevice?.id, bleState, linkSession]);
 
   useEffect(() => {
@@ -569,7 +594,7 @@ function App(): React.JSX.Element {
         useNativeDriver: true,
       }).start();
     }
-  }, [resultAnim, scanOutcome, lastRecording?.windowId]);
+  }, [resultAnim, scanOutcome, lastRecording]);
 
   useEffect(() => {
     if (feedbackOutcomeRef.current === scanOutcome) {
@@ -684,135 +709,248 @@ function App(): React.JSX.Element {
                     : `${TARGET_BLE_NAME} visible at ${formatRssi(targetDevice.rssi)} — preparing secure link.`;
 
   return (
-    <SafeAreaView style={styles.safe}>
-      <StatusBar barStyle="light-content" />
+    <Box
+      flex={1}
+      bg="#020617"
+      pt={insets.top}
+      pl={insets.left}
+      pr={insets.right}>
+      <StatusBar barStyle="light-content" backgroundColor="#020617" />
       <NeonBackdrop variant={scanOutcome} />
       <ScrollView
-        style={styles.scroll}
-        contentContainerStyle={styles.scrollContent}
+        flex={1}
+        showsVerticalScrollIndicator
         keyboardShouldPersistTaps="handled"
-        showsVerticalScrollIndicator={true}>
-        <View style={styles.header}>
-          <Text style={styles.kicker}>ABRACADABRA LINK</Text>
-          <Text style={styles.title}>Xerces Aurora - Abracadabra</Text>
-        </View>
-
-        <View style={[styles.heroCard, compactListeningHero && styles.heroCardListening]}>
-          <CyberOrb
-            pulse={pulse}
-            resultAnim={resultAnim}
-            glyph={orbGlyph}
-            tone={orbTone}
-            compact={compactListeningHero}
-          />
-          <View style={styles.statusCopy}>
+        contentContainerStyle={styles.scrollContent}>
+        <VStack space="sm" px="$5" pt="$4" pb="$10">
+          <VStack space="xs" mb="$3">
             <Text
-              style={[styles.statusTitle, compactListeningHero && styles.statusTitleListening]}>
-              {titleMain}
+              fontSize="$xs"
+              fontWeight="$extrabold"
+              letterSpacing="$xl"
+              color="#67e8f9"
+              textTransform="uppercase">
+              Abracadabra link
             </Text>
-            <Text style={[styles.statusBody, compactListeningHero && styles.statusBodyListening]}>
-              {bodyMain}
-            </Text>
-            <Animated.View
-              pointerEvents="none"
-              style={[
-                styles.resultBurst,
-                compactListeningHero && styles.resultBurstListening,
-                {
-                  opacity: resultAnim,
-                  transform: [
+            <Heading size="xl" color="$coolGray50" letterSpacing="$sm" lineHeight="$2xl">
+              Xerces Aurora — Abracadabra
+            </Heading>
+            <Divider bg="rgba(34,211,238,0.25)" my="$2" />
+          </VStack>
+
+          <Box
+            borderRadius="$3xl"
+            borderWidth={1}
+            borderColor="rgba(34,211,238,0.45)"
+            bg="rgba(2,6,23,0.88)"
+            px={compactListeningHero ? '$3' : '$5'}
+            py={compactListeningHero ? '$3' : '$5'}
+            sx={{
+              shadowColor: '#00f5ff',
+              shadowOffset: {width: 0, height: 10},
+              shadowOpacity: 0.28,
+              shadowRadius: 22,
+              elevation: 10,
+              _android: {elevation: 8},
+            }}>
+            <VStack space="md">
+              <Box alignSelf="center">
+                <CyberOrb
+                  pulse={pulse}
+                  resultAnim={resultAnim}
+                  glyph={orbGlyph}
+                  tone={orbTone}
+                  compact={compactListeningHero}
+                />
+              </Box>
+              <VStack space="sm">
+                <Heading
+                  size={compactListeningHero ? 'md' : 'xl'}
+                  color="$coolGray50"
+                  fontWeight="$extrabold">
+                  {titleMain}
+                </Heading>
+                <Text
+                  color="$coolGray300"
+                  fontSize={compactListeningHero ? '$sm' : '$md'}
+                  lineHeight={compactListeningHero ? '$sm' : '$lg'}>
+                  {bodyMain}
+                </Text>
+                <Animated.View
+                  pointerEvents="none"
+                  style={[
+                    styles.burstBadgeWrap,
+                    compactListeningHero && styles.burstBadgeWrapCompact,
                     {
-                      scale: resultAnim.interpolate({
-                        inputRange: [0, 1],
-                        outputRange: [0.88, 1],
-                      }),
+                      opacity: resultAnim,
+                      transform: [
+                        {
+                          scale: resultAnim.interpolate({
+                            inputRange: [0, 1],
+                            outputRange: [0.88, 1],
+                          }),
+                        },
+                      ],
                     },
-                  ],
-                },
-              ]}>
-              <Text
-                style={[
-                  styles.resultBurstText,
-                  compactListeningHero && styles.resultBurstTextListening,
-                  scanOutcome === 'not-found' && styles.resultBurstTextWarning,
-                  connPhase === 'error' && styles.resultBurstTextWarning,
-                ]}>
-                {burstLabel}
+                  ]}>
+                  <Badge
+                    size="sm"
+                    variant="outline"
+                    action={
+                      scanOutcome === 'not-found' || connPhase === 'error'
+                        ? 'error'
+                        : 'success'
+                    }
+                    borderColor={
+                      scanOutcome === 'not-found' || connPhase === 'error'
+                        ? 'rgba(253,164,175,0.65)'
+                        : 'rgba(124,255,212,0.55)'
+                    }
+                    bg={
+                      scanOutcome === 'not-found' || connPhase === 'error'
+                        ? 'rgba(127,29,29,0.25)'
+                        : 'rgba(20,184,166,0.14)'
+                    }>
+                    <BadgeText
+                      color={
+                        scanOutcome === 'not-found' || connPhase === 'error'
+                          ? '#fecdd3'
+                          : '#a7f3d0'
+                      }
+                      fontWeight="$bold"
+                      fontSize={compactListeningHero ? 9 : 11}
+                      letterSpacing="$md"
+                      textTransform="uppercase">
+                      {burstLabel}
+                    </BadgeText>
+                  </Badge>
+                </Animated.View>
+              </VStack>
+            </VStack>
+          </Box>
+
+          {transferNote != null ? (
+            <Alert
+              action="error"
+              variant="outline"
+              mt="$4"
+              borderRadius="$xl"
+              borderColor="rgba(255,56,100,0.55)"
+              bg="rgba(69,10,10,0.38)">
+              <AlertText fontWeight="$bold" color="#fecdd3" textTransform="uppercase" fontSize="$xs">
+                Transfer rolled back
+              </AlertText>
+              <AlertText mt="$2" color="#fda4af" fontFamily="Menlo" fontSize="$sm">
+                {transferNote}
+              </AlertText>
+            </Alert>
+          ) : null}
+
+          {lastRecording != null ? (
+            <Box
+              mt="$4"
+              p="$4"
+              borderRadius="$2xl"
+              borderWidth={1}
+              borderColor="rgba(34,211,238,0.38)"
+              bg="rgba(2,6,23,0.78)">
+              <Heading
+                size="sm"
+                color="$coolGray50"
+                fontWeight="$extrabold"
+                letterSpacing="$lg"
+                textTransform="uppercase">
+                Recording timeline
+              </Heading>
+              <Text mt="$2" fontSize="$xs" color="$coolGray400" lineHeight="$sm">
+                Downsampled curves vs capture order (sorted by MCU timestamp). Raw accelerometer and gyroscope axes plus ‖accel‖.
               </Text>
-            </Animated.View>
-          </View>
-        </View>
+              <Box mt="$3">
+                <RecordingTimelineCharts
+                  samples={lastRecording.samples}
+                  windowId={lastRecording.windowId}
+                />
+              </Box>
+            </Box>
+          ) : null}
 
-        {transferNote != null ? (
-          <View style={styles.transferAlert}>
-            <Text style={styles.transferAlertTitle}>Transfer rolled back</Text>
-            <Text style={styles.transferAlertBody}>{transferNote}</Text>
-          </View>
-        ) : null}
+          {!scanning && scanOutcome !== 'idle' ? (
+            <HStack space="md" mt="$5" alignItems="stretch">
+              <Button
+                flex={1}
+                size="lg"
+                borderRadius="$2xl"
+                bg="#00f5ff"
+                onPress={startScan}
+                isDisabled={scanning}
+                opacity={scanning ? 0.45 : 1}>
+                <ButtonText color="#020617" fontWeight="$extrabold" letterSpacing="$md" fontSize="$md">
+                  {scanning ? 'Finding...' : 'Scan again'}
+                </ButtonText>
+              </Button>
+              <Button
+                w={100}
+                size="lg"
+                variant="outline"
+                borderRadius="$2xl"
+                borderColor="rgba(217,70,239,0.72)"
+                bg="rgba(15,23,42,0.85)"
+                onPress={finishScan}
+                isDisabled={!scanning}
+                opacity={!scanning ? 0.45 : 1}>
+                <ButtonText color="#f0abfc" fontWeight="$extrabold" letterSpacing="$lg">
+                  Stop
+                </ButtonText>
+              </Button>
+            </HStack>
+          ) : null}
 
-        {lastRecording != null ? (
-          <View style={styles.recordingCard}>
-            <Text style={styles.panelTitle}>Motion signature</Text>
-            <Text style={styles.recordingHint}>
-              Trail ≈ integrated accel XY (wearable frame). Ribbon ≈ ‖accel‖ envelope over time.
-            </Text>
-            <ImuMotionSkia
-              samples={lastRecording.samples}
-              windowId={lastRecording.windowId}
-            />
-          </View>
-        ) : null}
-
-        <View
-          style={[
-            styles.actions,
-            scanning && styles.actionsHidden,
-            scanOutcome === 'idle' && styles.actionsHidden,
-          ]}>
-          <TouchableOpacity
-            activeOpacity={0.82}
-            onPress={startScan}
-            disabled={scanning}
-            style={[styles.primaryButton, scanning && styles.disabledButton]}>
-            <Text style={styles.primaryButtonText}>
-              {scanning ? 'Finding...' : 'Scan Again'}
-            </Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            activeOpacity={0.82}
-            onPress={finishScan}
-            disabled={!scanning}
-            style={[styles.secondaryButton, !scanning && styles.disabledButton]}>
-            <Text style={styles.secondaryButtonText}>Stop</Text>
-          </TouchableOpacity>
-        </View>
-
-        {scanOutcome === 'not-found' ? (
-          <View style={styles.troubleshootCard}>
-            <Text style={styles.panelTitle}>Troubleshooting</Text>
-            <Text style={styles.checkItem}>01 · Confirm the XIAO is powered and flashed.</Text>
-            <Text style={styles.checkItem}>02 · Serial should print BLE advertising as "{TARGET_BLE_NAME}".</Text>
-            <Text style={styles.checkItem}>03 · Move the phone closer and avoid covering the antenna.</Text>
-            <Text style={styles.checkItem}>04 · Toggle iPhone Bluetooth if CoreBluetooth cached old data.</Text>
-          </View>
-        ) : null}
+          {scanOutcome === 'not-found' ? (
+            <Box
+              mt="$5"
+              p="$4"
+              borderRadius="$2xl"
+              borderWidth={1}
+              borderColor="rgba(255,56,100,0.5)"
+              bg="rgba(69,10,10,0.34)">
+              <Heading
+                size="sm"
+                color="$coolGray50"
+                fontWeight="$extrabold"
+                letterSpacing="$lg"
+                textTransform="uppercase">
+                Troubleshooting
+              </Heading>
+              <Text mt="$3" color="#fecdd3" fontSize="$sm" fontFamily="Menlo">
+                01 · Confirm the XIAO is powered and flashed.
+              </Text>
+              <Text mt="$2" color="#fecdd3" fontSize="$sm" fontFamily="Menlo">
+                02 · Serial should print BLE advertising as "{TARGET_BLE_NAME}".
+              </Text>
+              <Text mt="$2" color="#fecdd3" fontSize="$sm" fontFamily="Menlo">
+                03 · Move the phone closer and avoid covering the antenna.
+              </Text>
+              <Text mt="$2" color="#fecdd3" fontSize="$sm" fontFamily="Menlo">
+                04 · Toggle iPhone Bluetooth if CoreBluetooth cached old data.
+              </Text>
+            </Box>
+          ) : null}
+        </VStack>
       </ScrollView>
-    </SafeAreaView>
+    </Box>
   );
 }
 
 const styles = StyleSheet.create({
-  safe: {
-    flex: 1,
-    backgroundColor: '#020617',
+  burstBadgeWrap: {
+    alignSelf: 'flex-start',
+    marginTop: 14,
   },
-  scroll: {
-    flex: 1,
+  burstBadgeWrapCompact: {
+    marginTop: 10,
   },
   scrollContent: {
     flexGrow: 1,
-    paddingHorizontal: 20,
-    paddingTop: 16,
     paddingBottom: 36,
   },
   gridOverlay: {
@@ -825,51 +963,6 @@ const styles = StyleSheet.create({
     backgroundColor: 'transparent',
     borderColor: '#00f5ff',
     borderWidth: StyleSheet.hairlineWidth,
-  },
-  header: {marginBottom: 14},
-  kicker: {
-    color: '#67e8f9',
-    fontSize: 12,
-    fontWeight: '800',
-    letterSpacing: 2.4,
-    textTransform: 'uppercase',
-  },
-  title: {
-    marginTop: 6,
-    color: '#f8fafc',
-    fontSize: 26,
-    fontWeight: '900',
-    letterSpacing: -0.6,
-    lineHeight: 32,
-  },
-  heroCard: {
-    borderRadius: 28,
-    borderWidth: 1,
-    borderColor: 'rgba(34, 211, 238, 0.42)',
-    backgroundColor: 'rgba(2, 6, 23, 0.78)',
-    padding: 20,
-    shadowColor: '#00f5ff',
-    shadowOpacity: 0.32,
-    shadowRadius: 24,
-    shadowOffset: {width: 0, height: 10},
-  },
-  heroCardListening: {
-    paddingVertical: 12,
-    paddingHorizontal: 14,
-    borderRadius: 22,
-    shadowRadius: 16,
-    shadowOffset: {width: 0, height: 6},
-  },
-  orbFrame: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    height: 230,
-  },
-  orbFrameCompact: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    height: 148,
-    marginBottom: -4,
   },
   orbPulse: {
     position: 'absolute',
@@ -918,167 +1011,14 @@ const styles = StyleSheet.create({
   orbGlyphWarning: {
     color: '#fecdd3',
   },
-  statusCopy: {
-    marginTop: 4,
-  },
-  statusTitle: {
-    color: '#f8fafc',
-    fontSize: 26,
-    fontWeight: '900',
-  },
-  statusTitleListening: {
-    fontSize: 20,
-    lineHeight: 26,
-  },
-  statusBody: {
-    marginTop: 8,
-    color: '#cbd5e1',
-    fontSize: 15,
-    lineHeight: 22,
-  },
-  statusBodyListening: {
-    marginTop: 6,
-    fontSize: 13,
-    lineHeight: 18,
-  },
-  resultBurst: {
-    alignSelf: 'flex-start',
-    marginTop: 14,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: 'rgba(124, 255, 212, 0.54)',
-    backgroundColor: 'rgba(20, 184, 166, 0.14)',
-    paddingHorizontal: 12,
-    paddingVertical: 7,
-  },
-  resultBurstListening: {
-    marginTop: 10,
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-  },
-  resultBurstText: {
-    color: '#a7f3d0',
-    fontSize: 11,
-    fontWeight: '900',
-    letterSpacing: 0.8,
-    textTransform: 'uppercase',
-  },
-  resultBurstTextListening: {
-    fontSize: 9,
-    letterSpacing: 0.6,
-  },
-  resultBurstTextWarning: {
-    color: '#fecdd3',
-  },
-  actions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-    marginTop: 18,
-  },
-  actionsHidden: {
-    opacity: 0,
-    height: 0,
-    marginTop: 0,
-    overflow: 'hidden',
-  },
-  primaryButton: {
-    flex: 1,
-    minHeight: 52,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: 18,
-    backgroundColor: '#00f5ff',
-    shadowColor: '#00f5ff',
-    shadowOpacity: 0.55,
-    shadowRadius: 18,
-    shadowOffset: {width: 0, height: 0},
-  },
-  primaryButtonText: {
-    color: '#020617',
-    fontSize: 16,
-    fontWeight: '900',
-    letterSpacing: 0.8,
-    textTransform: 'uppercase',
-  },
-  secondaryButton: {
-    width: 92,
-    minHeight: 52,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: 18,
-    borderWidth: 1,
-    borderColor: 'rgba(217, 70, 239, 0.68)',
-    backgroundColor: 'rgba(15, 23, 42, 0.72)',
-  },
-  secondaryButtonText: {
-    color: '#f0abfc',
-    fontSize: 14,
-    fontWeight: '900',
-    letterSpacing: 1,
-    textTransform: 'uppercase',
-  },
-  disabledButton: {
-    opacity: 0.45,
-  },
-  troubleshootCard: {
-    marginTop: 18,
-    borderRadius: 22,
-    borderWidth: 1,
-    borderColor: 'rgba(255, 56, 100, 0.48)',
-    backgroundColor: 'rgba(69, 10, 10, 0.34)',
-    padding: 16,
-  },
-  panelTitle: {
-    color: '#f8fafc',
-    fontSize: 15,
-    fontWeight: '900',
-    letterSpacing: 1,
-    textTransform: 'uppercase',
-  },
-  checkItem: {
-    marginTop: 8,
-    color: '#fecdd3',
-    fontSize: 13,
-    lineHeight: 19,
-    fontFamily: 'Menlo',
-  },
-  transferAlert: {
-    marginTop: 14,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: 'rgba(255, 56, 100, 0.5)',
-    backgroundColor: 'rgba(69, 10, 10, 0.35)',
-    padding: 14,
-  },
-  transferAlertTitle: {
-    color: '#fecdd3',
-    fontSize: 13,
-    fontWeight: '900',
-    letterSpacing: 1,
-    textTransform: 'uppercase',
-  },
-  transferAlertBody: {
-    marginTop: 6,
-    color: '#fda4af',
-    fontSize: 13,
-    lineHeight: 19,
-    fontFamily: 'Menlo',
-  },
-  recordingCard: {
-    marginTop: 16,
-    borderRadius: 22,
-    borderWidth: 1,
-    borderColor: 'rgba(34, 211, 238, 0.38)',
-    backgroundColor: 'rgba(2, 6, 23, 0.72)',
-    padding: 14,
-  },
-  recordingHint: {
-    marginTop: 6,
-    color: '#94a3b8',
-    fontSize: 12,
-    lineHeight: 17,
-  },
 });
 
-export default App;
+export default function App(): React.JSX.Element {
+  return (
+    <SafeAreaProvider>
+      <GluestackUIProvider config={config} colorMode="dark">
+        <AbracadabraScreen />
+      </GluestackUIProvider>
+    </SafeAreaProvider>
+  );
+}
