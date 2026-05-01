@@ -2,16 +2,18 @@ This is a new [**React Native**](https://reactnative.dev) project, bootstrapped 
 
 ## Bluetooth (BLE)
 
-This app uses [**react-native-ble-plx**](https://github.com/dotintent/react-native-ble-plx) for scanning and (later) connecting to your wearable.
+This app uses [**react-native-ble-plx**](https://github.com/dotintent/react-native-ble-plx) to scan, **connect**, discover GATT, and **subscribe** to the wearable’s NOTIFY stream.
 
 - **iOS:** `ios/AbracadabraRnApp/Info.plist` includes `NSBluetoothAlwaysUsageDescription` and `NSBluetoothPeripheralUsageDescription`. After changing native deps: `cd ios && bundle exec pod install`.
-- **UI:** `App.tsx` — scan for 10 seconds, list discovered peripherals (tap **Stop scan** to end early).
+- **Flow:** Auto-scan for **`XA_Abracadabra`** → connect → discover → monitor **`ADAB0003-…`** on service **`ADAB0001-…`**. After an **accepted** double-tap recording on the MCU, the peripheral pushes **META → CHUNK\* → COMMIT** framed packets (`bleRecordingProtocol.ts`). Partial or CRC-failed transfers are **rolled back** (discarded). Samples render as a Skia **motion trail + energy ribbon** (`ImuMotionSkia.tsx`).
+- **Reconnect:** After an unexpected disconnect, the app waits ~**1.8 s** and reconnects automatically (same peripheral id), up to **15** tries, then shows **Link Lost** until **Scan Again**.
+- **Android:** `requestMTU(247)` runs after connect when supported (larger chunks).
 
-This repo is set up for **iPhone** deployment; the React Native template still includes an `android/` folder, but BLE is configured only for iOS here.
+This repo is set up for **iPhone** deployment; the React Native template still includes an `android/` folder.
 
 ### Pairing with **abracadabra-platformio**
 
-Firmware exposes a friendly advertising name (`kBleDeviceName` in `src/main.cpp`, e.g. **XA_Abracadabra**) and a placeholder GATT service **`ADAB0001-0000-1000-8000-00805F9B34FB`** (discover after connect — it is not necessarily in the advertisement packet).
+Firmware exposes `kBleDeviceName` (e.g. **XA_Abracadabra**), GATT service **`ADAB0001-0000-1000-8000-00805F9B34FB`**, and NOTIFY **`ADAB0003-0000-1000-8000-00805F9B34FB`** for recordings (see firmware README for framing).
 
 ### Scan list: name vs UUID (iOS)
 
