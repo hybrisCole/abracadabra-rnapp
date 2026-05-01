@@ -1,5 +1,49 @@
 This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
 
+## Bluetooth (BLE)
+
+This app uses [**react-native-ble-plx**](https://github.com/dotintent/react-native-ble-plx) for scanning and (later) connecting to your wearable.
+
+- **iOS:** `ios/AbracadabraRnApp/Info.plist` includes `NSBluetoothAlwaysUsageDescription` and `NSBluetoothPeripheralUsageDescription`. After changing native deps: `cd ios && bundle exec pod install`.
+- **UI:** `App.tsx` — scan for 10 seconds, list discovered peripherals (tap **Stop scan** to end early).
+
+This repo is set up for **iPhone** deployment; the React Native template still includes an `android/` folder, but BLE is configured only for iOS here.
+
+### Pairing with **abracadabra-platformio**
+
+Firmware exposes a friendly advertising name (`kBleDeviceName` in `src/main.cpp`, e.g. **XA_Abracadabra**) and a placeholder GATT service **`ADAB0001-0000-1000-8000-00805F9B34FB`** (discover after connect — it is not necessarily in the advertisement packet).
+
+### Scan list: name vs UUID (iOS)
+
+On iOS, [**MultiplatformBleAdapter**](https://github.com/dotintent/MultiplatformBleAdapter) exposes **`name`** from `CBPeripheral.name` (often **`Arduino`** on mbed if you only looked at that field) and **`localName`** from `CBAdvertisementDataLocalNameKey` (the advertised name). **`App.tsx`** merges scan callbacks and **prefers `localName`** so the row title matches what the firmware broadcasts.
+
+The long **`device.id`** line (UUID format) is **Apple’s peripheral identifier**, not the firmware service UUID.
+
+### Run on a physical iPhone
+
+1. Connect the phone with USB and trust the computer.
+2. Open **`ios/AbracadabraRnApp.xcworkspace`** in Xcode → target **AbracadabraRnApp** → **Signing & Capabilities** → select your **Team**.
+3. From the project root (with Node 25: `source ~/.nvm/nvm.sh && nvm use 25`):
+
+```sh
+npm start
+```
+
+In another terminal:
+
+```sh
+npx react-native run-ios --device
+```
+
+Or pick your device and press Run in Xcode while Metro is running.
+
+### Metro + nvm (`env: node: No such file or directory`)
+
+Opening **`node_modules/.generated/launchPackager.command`** uses a bare shell — **`nvm` is not loaded**, so `node` is missing.
+
+- **Recommended:** from the project root, run `source ~/.nvm/nvm.sh && nvm use 25 && npm start`, or double‑click **`StartMetro.command`** in the repo root (same thing; executable wrapper).
+- **Xcode builds:** **`ios/.xcode.env.local`** sets **`NODE_BINARY`** after **`nvm use 25`** so Xcode’s shell scripts see `node`. That file is gitignored — start from **`ios/.xcode.env.local.example`** (`cp ios/.xcode.env.local.example ios/.xcode.env.local`) on a new clone.
+
 # Getting Started
 
 > **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
