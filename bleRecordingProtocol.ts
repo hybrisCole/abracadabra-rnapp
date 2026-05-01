@@ -1,7 +1,8 @@
 /**
  * Abracadabra BLE recording transfer:
- * - META notify on ADAB0003 (small, reliable): window, sample count, total bytes, CRC-32.
- * - Payload: central writes uint32 LE offset to ADAB0004, reads slice from ADAB0005 (GATT pull).
+ * - ADAB0003 NOTIFY framed packets: magic 0xADAB LE, pkt byte, reserved, payload.
+ * - RECORDING_PENDING (pkt 4): 4 B payload — window_id u16 LE, proto_ver u8 — sent when DT is accepted (before capture).
+ * - META (pkt 1): window, sample count, total bytes, CRC-32 — after capture; central pulls payload via ADAB0004/0005.
  */
 
 import type {Device} from 'react-native-ble-plx';
@@ -36,14 +37,15 @@ export type DecodedRecording = {
 
 export type FeedResult =
   | {kind: 'idle'}
+  | {kind: 'recording_pending'; windowId: number}
   | {
-      kind: 'pull_pending';
-      windowId: number;
-      samples: number;
-      totalBytes: number;
-      crcExpected: number;
-      recvEpoch: number;
-    }
+    kind: 'pull_pending';
+    windowId: number;
+    samples: number;
+    totalBytes: number;
+    crcExpected: number;
+    recvEpoch: number;
+  }
   | {kind: 'error'; message: string};
 
 /** IEEE CRC-32 over full packed payload (same loop as firmware crc32Ieee). */
@@ -90,6 +92,9 @@ export function parsePackedSamples(buffer: Uint8Array): ImuSample[] {
 }
 
 const PK_META = 1;
+/** Firmware sends this immediately after an accepted double-tap (before LED cue / sampling). */
+const PK_RECORDING_PENDING = 4;
+const RECORDING_PENDING_PAYLOAD_LEN = 4;
 
 /** META framed payload after 4-byte header (matches firmware meta[16]). */
 const META_PAYLOAD_LEN = 16;
@@ -186,7 +191,7 @@ export async function pullPackedPayloadFromPeripheral(
 }
 
 /**
- * Parses META notify only (legacy stray packets ignored).
+ * Parses NOTIFY frames from ADAB0003 (RECORDING_PENDING, META, etc.).
  */
 export class RecordingAssembler {
   private recvEpoch = 0;
@@ -210,6 +215,22 @@ export class RecordingAssembler {
       return {kind: 'error', message: 'Bad frame magic'};
     }
     const pktType = packet[2];
+
+    if (pktType === PK_RECORDING_PENDING) {
+      if (packet.byteLength < 4 + RECORDING_PENDING_PAYLOAD_LEN) {
+        return {kind: 'error', message: 'RECORDING_PENDING too short'};
+      }
+      const windowId = readU16Le(dv, 4);
+      const proto = packet[6];
+      if (proto !== 1) {
+        return {
+          kind: 'error',
+          message: `RECORDING_PENDING unsupported proto ${proto}`,
+        };
+      }
+      logBleRx('RECORDING_PENDING', {windowId});
+      return {kind: 'recording_pending', windowId};
+    }
 
     if (pktType !== PK_META) {
       return {kind: 'idle'};

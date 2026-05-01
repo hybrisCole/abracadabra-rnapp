@@ -4,7 +4,7 @@
  * @format
  */
 
-import React, {useCallback, useEffect, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   Animated,
   Easing,
@@ -19,8 +19,6 @@ import {SafeAreaProvider, useSafeAreaInsets} from 'react-native-safe-area-contex
 import {
   Alert,
   AlertText,
-  Badge,
-  BadgeText,
   Box,
   Button,
   ButtonText,
@@ -51,6 +49,7 @@ import {
   RecordingAssembler,
   type DecodedRecording,
 } from './bleRecordingProtocol';
+import {BleLinkStatusBadge, type LinkBadgeStatus} from './BleLinkStatusBadge';
 import {RecordingTimelineCharts} from './RecordingTimelineCharts';
 
 const TARGET_BLE_NAME = 'XA_Abracadabra';
@@ -77,8 +76,6 @@ type DeviceRow = {
 type ScanOutcome = 'idle' | 'scanning' | 'found' | 'not-found';
 
 type ConnPhase = 'off' | 'connecting' | 'linked' | 'error';
-
-type OrbTone = 'seek' | 'linked' | 'warn' | 'stream';
 
 function base64ToBytes(b64: string): Uint8Array {
   const atobFn = (globalThis as unknown as {atob: (s: string) => string}).atob;
@@ -131,97 +128,10 @@ function NeonBackdrop({variant}: {variant: ScanOutcome}): React.JSX.Element {
   );
 }
 
-function CyberOrb({
-  pulse,
-  resultAnim,
-  glyph,
-  tone,
-  compact = false,
-}: {
-  pulse: Animated.Value;
-  resultAnim: Animated.Value;
-  glyph: string;
-  tone: OrbTone;
-  compact?: boolean;
-}): React.JSX.Element {
-  const isMissing = tone === 'warn';
-  const isLinkedLike = tone === 'linked' || tone === 'stream';
-  const glowColor =
-    tone === 'warn'
-      ? '#ff3864'
-      : tone === 'stream'
-        ? '#f0abfc'
-        : isLinkedLike
-          ? '#7cffd4'
-          : '#00f5ff';
-  const orbitColor = isMissing ? '#ff7a90' : '#d946ef';
-  const scale = pulse.interpolate({
-    inputRange: [0, 1],
-    outputRange: compact ? [0.94, 1.06] : [0.94, 1.08],
-  });
-  const opacity = pulse.interpolate({
-    inputRange: [0, 1],
-    outputRange: [0.48, 1],
-  });
-  const resultScale = resultAnim.interpolate({
-    inputRange: [0, 1],
-    outputRange: compact ? [0.85, 1] : [0.82, 1],
-  });
-
-  const cx = compact ? 68 : 108;
-  const rGlowOuter = compact ? 58 : 92;
-  const rGlowMid = compact ? 43 : 68;
-  const rGlowInner = compact ? 21 : 34;
-  const rDot = 6;
-  const rStrokeInner = compact ? 36 : 58;
-
-  return (
-    <Box
-      alignItems="center"
-      justifyContent="center"
-      height={compact ? 148 : 230}
-      mb={compact ? -4 : undefined}>
-      <Animated.View
-        style={[
-          compact ? styles.orbPulseCompact : styles.orbPulse,
-          {
-            borderColor: glowColor,
-            shadowColor: glowColor,
-            opacity,
-            transform: [{scale}],
-          },
-        ]}
-      />
-      <Canvas style={compact ? styles.orbCanvasCompact : styles.orbCanvas}>
-        <Circle cx={cx} cy={cx} r={rGlowOuter} color="rgba(0,245,255,0.10)" />
-        <Circle cx={cx} cy={cx} r={rGlowMid} color="rgba(217,70,239,0.12)" />
-        <Circle cx={cx} cy={cx} r={rGlowInner} color={glowColor}>
-          <BlurMask blur={compact ? 12 : 18} style="normal" />
-        </Circle>
-        <Circle cx={cx} cy={cx} r={rDot} color="#f8fafc" />
-        <Circle cx={cx} cy={cx} r={rGlowOuter} color="transparent" style="stroke" strokeWidth={2} />
-        <Circle cx={cx} cy={cx} r={rStrokeInner} color={orbitColor} style="stroke" strokeWidth={1.5} />
-      </Canvas>
-      <Animated.Text
-        style={[
-          compact ? styles.orbGlyphCompact : styles.orbGlyph,
-          isMissing && styles.orbGlyphWarning,
-          (isLinkedLike || isMissing) && {
-            opacity: resultAnim,
-            transform: [{scale: resultScale}],
-          },
-        ]}>
-        {glyph}
-      </Animated.Text>
-    </Box>
-  );
-}
-
 function AbracadabraScreen(): React.JSX.Element {
   const managerRef = useRef<BleManager | null>(null);
   const scanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pulse = useRef(new Animated.Value(0)).current;
-  const resultAnim = useRef(new Animated.Value(0)).current;
   const feedbackOutcomeRef = useRef<ScanOutcome>('idle');
 
   const assemblerRef = useRef(new RecordingAssembler());
@@ -239,6 +149,12 @@ function AbracadabraScreen(): React.JSX.Element {
     filled: number;
     total: number;
   } | null>(null);
+  /** Firmware NOTIFY RECORDING_PENDING — onboard capture not finished yet. */
+  const [wearableCaptureArming, setWearableCaptureArming] = useState<{
+    windowId: number;
+  } | null>(null);
+  /** After GATT pull completes — CRC verify + unpack samples before timeline mounts. */
+  const [processingCapture, setProcessingCapture] = useState(false);
   const [transferNote, setTransferNote] = useState<string | null>(null);
   const [lastRecording, setLastRecording] = useState<DecodedRecording | null>(
     null,
@@ -248,6 +164,9 @@ function AbracadabraScreen(): React.JSX.Element {
   const [scanning, setScanning] = useState(false);
   const [bleState, setBleState] = useState<State>(State.Unknown);
   const [hasScanned, setHasScanned] = useState(false);
+
+  const [showFreshConnected, setShowFreshConnected] = useState(false);
+  const prevConnPhaseForBadgeRef = useRef<ConnPhase>('off');
 
   const insets = useSafeAreaInsets();
 
@@ -318,6 +237,8 @@ function AbracadabraScreen(): React.JSX.Element {
     setHasScanned(false);
     setConnPhase('off');
     setRecvProgress(null);
+    setWearableCaptureArming(null);
+    setProcessingCapture(false);
     setTransferNote(null);
     setLastRecording(null);
     assemblerRef.current.reset('scan again');
@@ -383,6 +304,8 @@ function AbracadabraScreen(): React.JSX.Element {
       }
       setConnPhase('off');
       setRecvProgress(null);
+      setWearableCaptureArming(null);
+      setProcessingCapture(false);
       return () => {};
     }
 
@@ -430,6 +353,8 @@ function AbracadabraScreen(): React.JSX.Element {
           bleMonitorSubRef.current?.remove();
           bleMonitorSubRef.current = null;
           setRecvProgress(null);
+          setWearableCaptureArming(null);
+          setProcessingCapture(false);
 
           disconnectSub?.remove();
 
@@ -469,6 +394,11 @@ function AbracadabraScreen(): React.JSX.Element {
             }
             const bytes = base64ToBytes(characteristic.value);
             const result = assemblerRef.current.feed(bytes);
+            if (result.kind === 'recording_pending') {
+              setWearableCaptureArming({windowId: result.windowId});
+              Vibration.vibrate([0, 45]);
+              return;
+            }
             if (result.kind === 'pull_pending') {
               if (pullInFlightRef.current) {
                 return;
@@ -479,22 +409,25 @@ function AbracadabraScreen(): React.JSX.Element {
                 return;
               }
               pullInFlightRef.current = true;
+              setWearableCaptureArming(null);
               setRecvProgress({filled: 0, total: result.totalBytes});
               pullPackedPayloadFromPeripheral(
                 linkedDev,
                 result.totalBytes,
                 (filled, total) => setRecvProgress({filled, total}),
               )
-                .then(payload =>
-                  finalizeRecordingFromPull(
+                .then(payload => {
+                  setRecvProgress(null);
+                  setProcessingCapture(true);
+                  return finalizeRecordingFromPull(
                     result.windowId,
                     result.samples,
                     result.crcExpected,
                     payload,
-                  ),
-                )
+                  );
+                })
                 .then(fin => {
-                  setRecvProgress(null);
+                  setProcessingCapture(false);
                   if ('error' in fin) {
                     setTransferNote(fin.error);
                   } else {
@@ -505,6 +438,7 @@ function AbracadabraScreen(): React.JSX.Element {
                 })
                 .catch(e => {
                   setRecvProgress(null);
+                  setProcessingCapture(false);
                   const msg = e instanceof Error ? e.message : String(e);
                   setTransferNote(msg);
                   if (__DEV__) {
@@ -555,6 +489,8 @@ function AbracadabraScreen(): React.JSX.Element {
         d.cancelConnection().catch(() => {});
       }
       setRecvProgress(null);
+      setWearableCaptureArming(null);
+      setProcessingCapture(false);
       setConnPhase('off');
     };
     // Re-run session only when peripheral id / radio / link generation changes (not DeviceRow churn).
@@ -580,21 +516,115 @@ function AbracadabraScreen(): React.JSX.Element {
         ? 'not-found'
         : 'idle';
 
+  const recvPct =
+    recvProgress != null && recvProgress.total > 0
+      ? Math.round((100 * recvProgress.filled) / recvProgress.total)
+      : null;
+
   useEffect(() => {
-    resultAnim.setValue(0);
-    const pulseBurst =
-      scanOutcome === 'found' ||
-      scanOutcome === 'not-found' ||
-      lastRecording != null;
-    if (pulseBurst) {
-      Animated.spring(resultAnim, {
-        toValue: 1,
-        friction: 5,
-        tension: 90,
-        useNativeDriver: true,
-      }).start();
+    const prev = prevConnPhaseForBadgeRef.current;
+    prevConnPhaseForBadgeRef.current = connPhase;
+    if (connPhase !== 'linked') {
+      setShowFreshConnected(false);
+      return;
     }
-  }, [resultAnim, scanOutcome, lastRecording]);
+    if (prev === 'linked') {
+      return;
+    }
+    setShowFreshConnected(true);
+    const t = setTimeout(() => setShowFreshConnected(false), 2200);
+    return () => clearTimeout(t);
+  }, [connPhase]);
+
+  const linkBadgeStatus = useMemo((): LinkBadgeStatus => {
+    if (bleState !== State.PoweredOn) {
+      return 'disconnected';
+    }
+    if (scanOutcome === 'not-found' || connPhase === 'error') {
+      return 'disconnected';
+    }
+    if (scanning) {
+      return 'connecting';
+    }
+    if (!targetDevice) {
+      return 'disconnected';
+    }
+    if (connPhase === 'connecting' && reconnectAttempt > 0) {
+      return 'retry';
+    }
+    if (connPhase === 'connecting') {
+      return 'connecting';
+    }
+    if (processingCapture) {
+      return 'processing';
+    }
+    if (recvProgress != null || wearableCaptureArming != null) {
+      return 'recording';
+    }
+    if (connPhase === 'linked') {
+      return showFreshConnected ? 'connected' : 'linked';
+    }
+    return 'disconnected';
+  }, [
+    bleState,
+    scanOutcome,
+    scanning,
+    targetDevice,
+    connPhase,
+    reconnectAttempt,
+    recvProgress,
+    wearableCaptureArming,
+    processingCapture,
+    showFreshConnected,
+  ]);
+
+  const linkDetail = useMemo(() => {
+    const title = TARGET_BLE_NAME;
+    let description = '';
+    if (scanOutcome === 'not-found') {
+      description =
+        'No controller signature appeared in 5 seconds. Check troubleshooting below, then retry.';
+    } else if (scanOutcome === 'scanning') {
+      description =
+        'Searching for the wearable automatically. Keep the phone nearby while the scanner listens for BLE advertisements.';
+    } else if (!targetDevice && bleState === State.PoweredOn) {
+      description =
+        'Warming up the scanner and preparing to search for the wearable.';
+    } else if (!targetDevice) {
+      description =
+        'Turn on Bluetooth permission/radio so the scanner can start.';
+    } else if (connPhase === 'error') {
+      description =
+        'The BLE session ended and automatic reconnect gave up after too many tries, or connect failed. Tap Scan Again. Incomplete transfers are discarded.';
+    } else if (recvProgress != null && recvPct != null) {
+      description = `Binary framing validated live (${recvProgress.filled} / ${recvProgress.total} bytes). CRC commits at end of transfer.`;
+    } else if (processingCapture && connPhase === 'linked') {
+      description =
+        'Transfer finished. Verifying the checksum and unpacking samples into the timeline — almost there.';
+    } else if (wearableCaptureArming != null && connPhase === 'linked') {
+      description = `Gesture accepted — RSSI ${formatRssi(targetDevice.rssi)}. The wearable waits briefly before sampling so tap motion does not dominate the trace. Stay steady until transfer begins.`;
+    } else if (connPhase === 'linked') {
+      description = `Paired — RSSI ${formatRssi(targetDevice.rssi)}. Perform the accepted double-tap gesture; when capture completes, the phone pulls the recording over GATT (META notify + read slices).`;
+    } else if (connPhase === 'connecting') {
+      description =
+        reconnectAttempt > 0
+          ? `Link dropped — retrying automatically (${reconnectAttempt} of ${MAX_AUTO_RECONNECT_ROUNDS}). Stay near the wearable.`
+          : 'Discovering ADAB services and subscribing to the NOTIFY stream characteristic.';
+    } else {
+      description = `Seen in scan — RSSI ${formatRssi(targetDevice.rssi)}. Preparing secure link.`;
+    }
+    return {title, description};
+  }, [
+    scanOutcome,
+    targetDevice,
+    bleState,
+    connPhase,
+    recvProgress,
+    recvPct,
+    wearableCaptureArming,
+    processingCapture,
+    reconnectAttempt,
+  ]);
 
   useEffect(() => {
     if (feedbackOutcomeRef.current === scanOutcome) {
@@ -608,105 +638,6 @@ function AbracadabraScreen(): React.JSX.Element {
       Vibration.vibrate([0, 60, 90, 60]);
     }
   }, [scanOutcome]);
-
-  let orbGlyph = 'FINDING';
-  let orbTone: OrbTone = 'seek';
-  if (scanOutcome === 'not-found') {
-    orbGlyph = 'NO SIGNAL';
-    orbTone = 'warn';
-  } else if (scanOutcome === 'scanning') {
-    orbGlyph = 'FINDING';
-    orbTone = 'seek';
-  } else if (targetDevice) {
-    if (connPhase === 'connecting') {
-      orbGlyph = 'PAIRING';
-      orbTone = 'seek';
-    } else if (connPhase === 'error') {
-      orbGlyph = 'LINK DOWN';
-      orbTone = 'warn';
-    } else if (recvProgress != null) {
-      orbGlyph = 'STREAM';
-      orbTone = 'stream';
-    } else if (connPhase === 'linked') {
-      orbGlyph = 'LINKED';
-      orbTone = 'linked';
-    } else {
-      orbGlyph = 'PAIRING';
-      orbTone = 'seek';
-    }
-  }
-
-  const recvPct =
-    recvProgress != null && recvProgress.total > 0
-      ? Math.round((100 * recvProgress.filled) / recvProgress.total)
-      : null;
-
-  const compactListeningHero =
-    targetDevice != null &&
-    connPhase === 'linked' &&
-    recvProgress == null &&
-    scanOutcome === 'found';
-
-  const burstLabel =
-    scanOutcome === 'not-found'
-      ? 'Missing-device alert sent'
-      : lastRecording != null
-        ? `Recording #${lastRecording.windowId} verified`
-        : recvProgress != null && recvPct != null
-          ? `Receiving capture · ${recvPct}%`
-          : connPhase === 'linked'
-            ? 'GATT linked · awaiting double-tap recording'
-          : connPhase === 'connecting'
-            ? reconnectAttempt > 0
-              ? `Reconnecting (${reconnectAttempt}/${MAX_AUTO_RECONNECT_ROUNDS})…`
-              : 'Negotiating BLE session…'
-              : connPhase === 'error'
-                ? 'Session lost — scan again'
-                : scanOutcome === 'found'
-                  ? 'Wearable discovered'
-                  : '';
-
-  const titleMain =
-    scanOutcome === 'not-found'
-      ? 'Wearable Not Present'
-      : scanOutcome === 'scanning'
-        ? 'Finding Device'
-        : !targetDevice && bleState === State.PoweredOn
-          ? 'Preparing Scanner'
-          : !targetDevice
-            ? 'Bluetooth Not Ready'
-            : connPhase === 'error'
-              ? 'Link Lost'
-              : recvProgress != null
-                ? 'Receiving Recording'
-                : connPhase === 'linked'
-                  ? 'Linked · Listening'
-                  : connPhase === 'connecting'
-                    ? reconnectAttempt > 0
-                      ? 'Reconnecting…'
-                      : 'Connecting…'
-                    : 'Wearable Found';
-
-  const bodyMain =
-    scanOutcome === 'not-found'
-      ? 'No controller signature appeared in 5 seconds. Check the troubleshooting steps below, then retry.'
-      : scanOutcome === 'scanning'
-        ? 'Searching for the wearable automatically. Keep the phone nearby while the scanner listens for BLE advertisements.'
-        : !targetDevice && bleState === State.PoweredOn
-          ? 'Warming up the scanner and preparing to search for the wearable.'
-          : !targetDevice
-            ? 'Turn on Bluetooth permission/radio so the scanner can start.'
-            : connPhase === 'error'
-              ? 'The BLE session ended and automatic reconnect gave up after too many tries, or connect failed. Tap Scan Again. Incomplete transfers are discarded.'
-              : recvProgress != null && recvPct != null
-                ? `Binary framing validated live (${recvProgress.filled} / ${recvProgress.total} bytes). CRC will commit at end of transfer.`
-                : connPhase === 'linked'
-                  ? `${TARGET_BLE_NAME} is paired at ${formatRssi(targetDevice.rssi)}. Perform the accepted double-tap gesture; when capture completes, the phone pulls the recording over GATT (META notify + read slices).`
-                  : connPhase === 'connecting'
-                    ? reconnectAttempt > 0
-                      ? `Link dropped — retrying automatically (${reconnectAttempt} of ${MAX_AUTO_RECONNECT_ROUNDS}). Stay near the wearable.`
-                      : 'Discovering ADAB services and subscribing to the NOTIFY stream characteristic.'
-                    : `${TARGET_BLE_NAME} visible at ${formatRssi(targetDevice.rssi)} — preparing secure link.`;
 
   return (
     <Box
@@ -738,95 +669,13 @@ function AbracadabraScreen(): React.JSX.Element {
             <Divider bg="rgba(34,211,238,0.25)" my="$2" />
           </VStack>
 
-          <Box
-            borderRadius="$3xl"
-            borderWidth={1}
-            borderColor="rgba(34,211,238,0.45)"
-            bg="rgba(2,6,23,0.88)"
-            px={compactListeningHero ? '$3' : '$5'}
-            py={compactListeningHero ? '$3' : '$5'}
-            sx={{
-              shadowColor: '#00f5ff',
-              shadowOffset: {width: 0, height: 10},
-              shadowOpacity: 0.28,
-              shadowRadius: 22,
-              elevation: 10,
-              _android: {elevation: 8},
-            }}>
-            <VStack space="md">
-              <Box alignSelf="center">
-                <CyberOrb
-                  pulse={pulse}
-                  resultAnim={resultAnim}
-                  glyph={orbGlyph}
-                  tone={orbTone}
-                  compact={compactListeningHero}
-                />
-              </Box>
-              <VStack space="sm">
-                <Heading
-                  size={compactListeningHero ? 'md' : 'xl'}
-                  color="$coolGray50"
-                  fontWeight="$extrabold">
-                  {titleMain}
-                </Heading>
-                <Text
-                  color="$coolGray300"
-                  fontSize={compactListeningHero ? '$sm' : '$md'}
-                  lineHeight={compactListeningHero ? '$sm' : '$lg'}>
-                  {bodyMain}
-                </Text>
-                <Animated.View
-                  pointerEvents="none"
-                  style={[
-                    styles.burstBadgeWrap,
-                    compactListeningHero && styles.burstBadgeWrapCompact,
-                    {
-                      opacity: resultAnim,
-                      transform: [
-                        {
-                          scale: resultAnim.interpolate({
-                            inputRange: [0, 1],
-                            outputRange: [0.88, 1],
-                          }),
-                        },
-                      ],
-                    },
-                  ]}>
-                  <Badge
-                    size="sm"
-                    variant="outline"
-                    action={
-                      scanOutcome === 'not-found' || connPhase === 'error'
-                        ? 'error'
-                        : 'success'
-                    }
-                    borderColor={
-                      scanOutcome === 'not-found' || connPhase === 'error'
-                        ? 'rgba(253,164,175,0.65)'
-                        : 'rgba(124,255,212,0.55)'
-                    }
-                    bg={
-                      scanOutcome === 'not-found' || connPhase === 'error'
-                        ? 'rgba(127,29,29,0.25)'
-                        : 'rgba(20,184,166,0.14)'
-                    }>
-                    <BadgeText
-                      color={
-                        scanOutcome === 'not-found' || connPhase === 'error'
-                          ? '#fecdd3'
-                          : '#a7f3d0'
-                      }
-                      fontWeight="$bold"
-                      fontSize={compactListeningHero ? 9 : 11}
-                      letterSpacing="$md"
-                      textTransform="uppercase">
-                      {burstLabel}
-                    </BadgeText>
-                  </Badge>
-                </Animated.View>
-              </VStack>
-            </VStack>
+          <Box width="100%">
+            <BleLinkStatusBadge
+              status={linkBadgeStatus}
+              pulse={pulse}
+              detailTitle={linkDetail.title}
+              detailDescription={linkDetail.description}
+            />
           </Box>
 
           {transferNote != null ? (
@@ -939,13 +788,6 @@ function AbracadabraScreen(): React.JSX.Element {
 }
 
 const styles = StyleSheet.create({
-  burstBadgeWrap: {
-    alignSelf: 'flex-start',
-    marginTop: 14,
-  },
-  burstBadgeWrapCompact: {
-    marginTop: 10,
-  },
   scrollContent: {
     flexGrow: 1,
     paddingBottom: 36,
@@ -960,53 +802,6 @@ const styles = StyleSheet.create({
     backgroundColor: 'transparent',
     borderColor: '#00f5ff',
     borderWidth: StyleSheet.hairlineWidth,
-  },
-  orbPulse: {
-    position: 'absolute',
-    width: 198,
-    height: 198,
-    borderRadius: 99,
-    borderWidth: 2,
-    shadowOpacity: 0.9,
-    shadowRadius: 24,
-    shadowOffset: {width: 0, height: 0},
-  },
-  orbPulseCompact: {
-    position: 'absolute',
-    width: 126,
-    height: 126,
-    borderRadius: 63,
-    borderWidth: 2,
-    shadowOpacity: 0.85,
-    shadowRadius: 14,
-    shadowOffset: {width: 0, height: 0},
-  },
-  orbCanvas: {
-    width: 216,
-    height: 216,
-  },
-  orbCanvasCompact: {
-    width: 136,
-    height: 136,
-  },
-  orbGlyph: {
-    position: 'absolute',
-    bottom: 24,
-    color: '#a7f3d0',
-    fontSize: 12,
-    fontWeight: '900',
-    letterSpacing: 3,
-  },
-  orbGlyphCompact: {
-    position: 'absolute',
-    bottom: 10,
-    color: '#a7f3d0',
-    fontSize: 10,
-    fontWeight: '900',
-    letterSpacing: 2,
-  },
-  orbGlyphWarning: {
-    color: '#fecdd3',
   },
 });
 
