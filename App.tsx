@@ -31,15 +31,6 @@ import {
   VStack,
 } from '@gluestack-ui/themed';
 import {config} from '@gluestack-ui/config';
-import {
-  BlurMask,
-  Canvas,
-  Circle,
-  Group,
-  LinearGradient,
-  Rect,
-  vec,
-} from '@shopify/react-native-skia';
 
 import {
   ABRACADABRA_SERVICE_UUID,
@@ -50,10 +41,15 @@ import {
   type DecodedRecording,
 } from './bleRecordingProtocol';
 import {BleLinkStatusBadge, type LinkBadgeStatus} from './BleLinkStatusBadge';
+import {NeonBackdrop} from './NeonBackdrop';
 import {RecordingTimelineCharts} from './RecordingTimelineCharts';
 
 const TARGET_BLE_NAME = 'XA_Abracadabra';
 const SCAN_DURATION_MS = 5000;
+
+/** Decorative hero title (combining marks); VoiceOver uses accessibilityLabel below. */
+const GLITCH_HERO_TITLE =
+  'X̴̢̢̘̪̬̯̘̓̓͒́̏ę̵̛͙͇͕̎̿́͋̍͊͆r̵̨̡̡̗̩̜͎̬̞̒̿̋̂̀̏̉͋̈́͠ͅc̵̲͔̺̠̦̹̞̳̊̎̅̑͗̓͐͗ȩ̵̧̞̭̩͉͔͙̻̄́͑̉̆̎͜͝s̴͇̰̠͕͎̈̇̄̀͌̊ ̶̼̯͛Ą̷̟̘̱͔̼̯̯̓͐̓͗̅̐̉͊̕͠ú̸̱̭̝͎̘͇͇̮̂͌͜ȑ̵̢̨͚͈͔̟̽̉̀͜ͅo̸̢͈͚̗͍̪̟̯̭͓̅̍́̋r̴̢̢̨̳̪̗͎͔͗͆͝ͅä̵̢̙́ ̷̢̲̜̱̊̔̄́ͅ-̸̟̪̲̼̝̳̫̻̐̈́̂̈́́͐ ̶̮̼̆̊̓̓̽A̴̼̯̍́͒͒̀͆̔̕͘͝b̵̰͕͕̣̏̍͑̌̅̉͊̒ͅr̷̗͉͈̥̓̀̾̽̿̂̒̿̏ā̸̡̛̖̱͉͇̹̥̇̉̎̈́ͅc̵͔͑͆̍̉̌͊͝͝a̵̢͙̮͎̤̳̻̘̒̽͑̾̍ḓ̴̣͉̯̝̍͆͒a̴̫̰͇͍͕̳͗͌̾̊̈b̴̡̤̞̪̊̍̉͠r̷̡̻̼͉̹̱͇̦̞̟̅̇a̸̟̼͛̉̽̇͑ͅ';
 
 /** Wait before retrying BLE connect after an unexpected peripheral disconnect. */
 const LINK_LOST_RETRY_DELAY_MS = 1800;
@@ -96,37 +92,6 @@ const isTargetDevice = (device: {
   localName?: string | null;
   name?: string | null;
 }) => isTargetName(device.localName) || isTargetName(device.name);
-
-function NeonBackdrop({variant}: {variant: ScanOutcome}): React.JSX.Element {
-  const accent = variant === 'not-found' ? '#ff3864' : '#00f5ff';
-  const secondary = variant === 'found' ? '#d946ef' : '#7c3aed';
-
-  return (
-    <Box pointerEvents="none" position="absolute" top={0} right={0} bottom={0} left={0}>
-      <Canvas style={StyleSheet.absoluteFill}>
-        <Rect x={0} y={0} width={440} height={900}>
-          <LinearGradient
-            start={vec(0, 0)}
-            end={vec(420, 900)}
-            colors={['#030712', '#09051f', '#020617']}
-          />
-        </Rect>
-        <Group opacity={0.65}>
-          <Circle cx={86} cy={120} r={124} color={secondary}>
-            <BlurMask blur={42} style="normal" />
-          </Circle>
-          <Circle cx={334} cy={214} r={148} color={accent}>
-            <BlurMask blur={54} style="normal" />
-          </Circle>
-          <Circle cx={220} cy={640} r={180} color="#0ea5e9">
-            <BlurMask blur={78} style="normal" />
-          </Circle>
-        </Group>
-      </Canvas>
-      <Box position="absolute" top={0} right={0} bottom={0} left={0} style={styles.gridOverlay} />
-    </Box>
-  );
-}
 
 function AbracadabraScreen(): React.JSX.Element {
   const managerRef = useRef<BleManager | null>(null);
@@ -411,21 +376,34 @@ function AbracadabraScreen(): React.JSX.Element {
               pullInFlightRef.current = true;
               setWearableCaptureArming(null);
               setRecvProgress({filled: 0, total: result.totalBytes});
+              console.log('[recording] started receiving payload', {
+                windowId: result.windowId,
+                samples: result.samples,
+                totalBytes: result.totalBytes,
+              });
               pullPackedPayloadFromPeripheral(
                 linkedDev,
                 result.totalBytes,
                 (filled, total) => setRecvProgress({filled, total}),
               )
-                .then(payload => {
-                  setRecvProgress(null);
-                  setProcessingCapture(true);
-                  return finalizeRecordingFromPull(
-                    result.windowId,
-                    result.samples,
-                    result.crcExpected,
-                    payload,
-                  );
-                })
+                .then(
+                  payload =>
+                    new Promise<
+                      DecodedRecording | {error: string}
+                    >((resolve, reject) => {
+                      setRecvProgress(null);
+                      setProcessingCapture(true);
+                      /** Next macrotask so React can paint Processing before sync finalize runs. */
+                      setTimeout(() => {
+                        finalizeRecordingFromPull(
+                          result.windowId,
+                          result.samples,
+                          result.crcExpected,
+                          payload,
+                        ).then(resolve, reject);
+                      }, 0);
+                    }),
+                )
                 .then(fin => {
                   setProcessingCapture(false);
                   if ('error' in fin) {
@@ -555,10 +533,10 @@ function AbracadabraScreen(): React.JSX.Element {
     if (connPhase === 'connecting') {
       return 'connecting';
     }
-    if (processingCapture) {
+    if (processingCapture || recvProgress != null) {
       return 'processing';
     }
-    if (recvProgress != null || wearableCaptureArming != null) {
+    if (wearableCaptureArming != null) {
       return 'recording';
     }
     if (connPhase === 'linked') {
@@ -655,16 +633,14 @@ function AbracadabraScreen(): React.JSX.Element {
         contentContainerStyle={styles.scrollContent}>
         <VStack space="sm" px="$5" pt="$4" pb="$10">
           <VStack space="xs" mb="$3">
-            <Text
-              fontSize="$xs"
-              fontWeight="$extrabold"
-              letterSpacing="$xl"
-              color="#67e8f9"
-              textTransform="uppercase">
-              Abracadabra link
-            </Text>
-            <Heading size="xl" color="$coolGray50" letterSpacing="$sm" lineHeight="$2xl">
-              Xerces Aurora — Abracadabra
+            <Heading
+              size="xl"
+              color="$coolGray50"
+              letterSpacing="$sm"
+              lineHeight="$3xl"
+              accessibilityRole="header"
+              accessibilityLabel="Xerces Aurora — Abracadabra">
+              {GLITCH_HERO_TITLE}
             </Heading>
             <Divider bg="rgba(34,211,238,0.25)" my="$2" />
           </VStack>
@@ -791,17 +767,6 @@ const styles = StyleSheet.create({
   scrollContent: {
     flexGrow: 1,
     paddingBottom: 36,
-  },
-  gridOverlay: {
-    position: 'absolute',
-    top: 0,
-    right: 0,
-    bottom: 0,
-    left: 0,
-    opacity: 0.16,
-    backgroundColor: 'transparent',
-    borderColor: '#00f5ff',
-    borderWidth: StyleSheet.hairlineWidth,
   },
 });
 

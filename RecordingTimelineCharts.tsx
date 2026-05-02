@@ -363,6 +363,12 @@ export function RecordingTimelineCharts({
     );
     const magNorm = normalizeMinMax(mag);
     const gyroMagNorm = normalizeMinMax(gyroMag);
+    const axNorm = normalizeMinMax(ax);
+    const ayNorm = normalizeMinMax(ay);
+    const azNorm = normalizeMinMax(az);
+    const gxNorm = normalizeMinMax(gx);
+    const gyNorm = normalizeMinMax(gy);
+    const gzNorm = normalizeMinMax(gz);
 
     return {
       tMin,
@@ -377,6 +383,12 @@ export function RecordingTimelineCharts({
       gyroMag,
       magNorm,
       gyroMagNorm,
+      axNorm,
+      ayNorm,
+      azNorm,
+      gxNorm,
+      gyNorm,
+      gzNorm,
     };
   }, [samples]);
 
@@ -415,6 +427,12 @@ export function RecordingTimelineCharts({
     gyroMag,
     magNorm,
     gyroMagNorm,
+    axNorm,
+    ayNorm,
+    azNorm,
+    gxNorm,
+    gyNorm,
+    gzNorm,
   } = prepared;
 
   const cropOverlayProps = {
@@ -534,7 +552,7 @@ export function RecordingTimelineCharts({
               );
             }}
           </TabsTab>
-          <TabsTab value="compare" {...tabChromeProps}>
+          <TabsTab value="allMag" {...tabChromeProps}>
             {state => {
               const s = state as unknown as TabSlotState;
               return (
@@ -544,7 +562,22 @@ export function RecordingTimelineCharts({
                 fontWeight="$extrabold"
                 letterSpacing="$sm"
                 color={s.active ? '#a3e635' : '#64748b'}>
-                COMPARE
+                ALL MAG
+              </TabsTabTitle>
+              );
+            }}
+          </TabsTab>
+          <TabsTab value="allRaw" {...tabChromeProps}>
+            {state => {
+              const s = state as unknown as TabSlotState;
+              return (
+              <TabsTabTitle
+                fontSize={10}
+                fontFamily="Menlo"
+                fontWeight="$extrabold"
+                letterSpacing="$sm"
+                color={s.active ? '#bef264' : '#64748b'}>
+                ALL RAW
               </TabsTabTitle>
               );
             }}
@@ -592,14 +625,29 @@ export function RecordingTimelineCharts({
               series={[{label: '‖ω‖', color: COLORS.gyroMag, values: gyroMag}]}
             />
           </TabsTabPanel>
-          <TabsTabPanel value="compare">
+          <TabsTabPanel value="allMag">
             <ChartPanel
-              title="Normalized compare"
-              subtitle="Each series min–max scaled to 0…1 to compare shape (not absolute units)."
+              title="All magnitudes (normalized)"
+              subtitle="‖a‖ and ‖ω‖ each min–max scaled to 0…1 to compare shape (not absolute units)."
               cropOverlay={cropOverlayProps}
               series={[
                 {label: '‖a‖ norm', color: COLORS.mag, values: magNorm},
                 {label: '‖ω‖ norm', color: COLORS.gyroMag, values: gyroMagNorm},
+              ]}
+            />
+          </TabsTabPanel>
+          <TabsTabPanel value="allRaw">
+            <ChartPanel
+              title="All raw axes (normalized)"
+              subtitle="ax…gz each min–max scaled to 0…1 — same scaling idea as ALL MAG, for raw axes."
+              cropOverlay={cropOverlayProps}
+              series={[
+                {label: 'ax norm', color: COLORS.ax, values: axNorm},
+                {label: 'ay norm', color: COLORS.ay, values: ayNorm},
+                {label: 'az norm', color: COLORS.az, values: azNorm},
+                {label: 'gx norm', color: COLORS.gx, values: gxNorm},
+                {label: 'gy norm', color: COLORS.gy, values: gyNorm},
+                {label: 'gz norm', color: COLORS.gz, values: gzNorm},
               ]}
             />
           </TabsTabPanel>

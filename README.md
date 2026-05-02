@@ -5,25 +5,29 @@ This is a new [**React Native**](https://reactnative.dev) project, bootstrapped 
 What this repo is today:
 
 - **Stack:** React Native **0.85.x**, React **19.2.3** (keep this **exact** patch in sync with the Hermes renderer bundled in RN or you’ll hit a version-mismatch runtime error). TypeScript. **[Gluestack UI](https://gluestack.io/ui)** (`@gluestack-ui/themed` + `@gluestack-ui/config`) drives layout with **forced dark** styling and neon-accent cyberpunk visuals in `App.tsx`.
-- **BLE transfer:** After an accepted recording on the wearable, the peripheral sends a small **META** notification on **`ADAB0003`**. The phone **does not** rely on streaming the whole payload over notify; it **GATT-pulls** bytes by writing a **32-bit little-endian offset** to **`ADAB0004`** and reading slices from **`ADAB0005`** until the buffer matches **META** (`sample_count`, `total_bytes`, **IEEE CRC-32**). Logic lives in **`bleRecordingProtocol.ts`**; partial or CRC-failed pulls are **rolled back**.
-- **Recording UI:** Verified recordings show a **Recording timeline** card with **[Gluestack Tabs](https://gluestack.io/ui)** switching SVG charts in **`RecordingTimelineCharts.tsx`**: **ACC RAW**, **GYRO RAW**, **ACC MAG** (‖a‖), **GYRO MAG** (‖ω‖), **COMPARE** (min–max normalized ‖a‖ vs ‖ω‖). A **window time** strip shows **`t_ms`** range from the samples (nominal **index × 5 ms** on the MCU—see firmware README); it is **not** BLE transfer duration.
-- **Native integration:** Safe area uses **`react-native-safe-area-context`** (`useSafeAreaInsets`), not deprecated RN `SafeAreaView`. **Skia** remains a dependency for ambient orb/backdrop graphics.
+- **BLE transfer:** The wearable sends **framed NOTIFY** packets on **`ADAB0003`** (magic **`0xADAB`** LE, **`pkt`** byte, reserved byte, payload):
+  - **`RECORDING_PENDING` (`pkt = 4`):** right after an **accepted** double-tap — payload **`window_id` u16 LE**, **`proto_ver` u8**, reserved — so the app can show **armed / recording** before onboard capture finishes.
+  - **`META` (`pkt = 1`):** after capture — **`window_id`**, **`sample_count`**, **`total_bytes`**, **IEEE CRC-32** over the full packed buffer (see **`bleRecordingProtocol.ts`**).
+  The phone **does not** stream the IMU blob over notify; it **GATT-pulls** by writing a **32-bit little-endian offset** to **`ADAB0004`** and reading slices from **`ADAB0005`** until **`total_bytes`** match **META**, then **CRC + decode**. Partial or CRC-failed pulls are **rolled back** in UI.
+- **Link UI:** **`BleLinkStatusBadge.tsx`** shows a compact capsule (**Gluestack Badge**-style): animated orb (≤30% width) + status label (**Connecting**, **Connected**, **Linked**, **Recording**, **Processing**, **Retry**, **Disconnected**). Tap the orb for a short detail **toast** (session/RSSI/GATT copy). After the byte pull completes, the badge shows **Processing** while **`finalizeRecordingFromPull`** verifies CRC and unpacks samples before the timeline appears.
+- **Recording UI:** Verified recordings show a **Recording timeline** card with **[Gluestack Tabs](https://gluestack.io/ui)** switching SVG charts in **`RecordingTimelineCharts.tsx`**: **ACC RAW**, **GYRO RAW**, **ACC MAG** (‖a‖), **GYRO MAG** (‖ω‖), **COMPARE** (min–max normalized ‖a‖ vs ‖ω‖). A **window time** strip shows **`t_ms`** range from the samples (nominal **index × 5 ms** on the MCU—see firmware README); it is **not** BLE transfer duration. **Crop timeline** sliders use **`@react-native-community/slider`** (run **`bundle exec pod install`** under **`ios/`** after install).
+- **Native integration:** Safe area uses **`react-native-safe-area-context`** (`useSafeAreaInsets`), not deprecated RN `SafeAreaView`. **Skia** is used for the **NeonBackdrop** gradient (main hero orb was replaced by the link badge).
 - **Install / Metro:** **`.npmrc`** sets **`legacy-peer-deps=true`** so Gluestack’s peer graph resolves cleanly. **`metro.config.js`** aliases **`react-dom`** to **`rn-shims/react-dom`** because Gluestack pulls **react-aria**, which expects **`flushSync`** from `react-dom` (not shipped on React Native).
 
 This repo is set up for **iPhone** deployment; the React Native template still includes an `android/` folder.
 
 ## Bluetooth (BLE)
 
-This app uses [**react-native-ble-plx**](https://github.com/dotintent/react-native-ble-plx) to scan, **connect**, discover GATT, **monitor** **`ADAB0003`** for META, and **pull** payload data via **`ADAB0004`** / **`ADAB0005`**.
+This app uses [**react-native-ble-plx**](https://github.com/dotintent/react-native-ble-plx) to scan, **connect**, discover GATT, **monitor** **`ADAB0003`** for framed **RECORDING_PENDING** + **META**, and **pull** payload data via **`ADAB0004`** / **`ADAB0005`**.
 
 - **iOS:** `ios/AbracadabraRnApp/Info.plist` includes `NSBluetoothAlwaysUsageDescription` and `NSBluetoothPeripheralUsageDescription`. After changing native deps: `cd ios && bundle exec pod install`.
-- **Flow:** Auto-scan for **`XA_Abracadabra`** → connect → discover → subscribe to **`ADAB0003-…`** on **`ADAB0001-…`**. On META, assemble payload with offset writes + read pulls → CRC check → decode 14-byte LE samples. Failed transfers surface as rollback UI state.
+- **Flow:** Auto-scan for **`XA_Abracadabra`** → connect → discover → subscribe to **`ADAB0003-…`** on **`ADAB0001-…`**. On **RECORDING_PENDING**, arm UI / vibrate; on **META**, pull payload with offset writes + read pulls → **Processing** → CRC check → decode 14-byte LE samples. Failed transfers surface as rollback UI state.
 - **Reconnect:** After an unexpected disconnect, the app waits ~**1.8 s** and reconnects automatically (same peripheral id), up to **15** tries, then shows **Link Lost** until **Scan Again**.
 - **Android:** `requestMTU(247)` runs after connect when supported (fewer read round-trips for pull).
 
 ### Pairing with **abracadabra-platformio**
 
-Firmware exposes `kBleDeviceName` (e.g. **XA_Abracadabra**), service **`ADAB0001-0000-1000-8000-00805F9B34FB`**, **META** on **`ADAB0003-…`**, pull control **`ADAB0004-…`**, pull data **`ADAB0005-…`** (see firmware README).
+Firmware exposes `kBleDeviceName` (e.g. **XA_Abracadabra**), service **`ADAB0001-0000-1000-8000-00805F9B34FB`**, **RECORDING_PENDING** + **META** on **`ADAB0003-…`**, pull control **`ADAB0004-…`**, pull data **`ADAB0005-…`** (see firmware README).
 
 ### Scan list: name vs UUID (iOS)
 
