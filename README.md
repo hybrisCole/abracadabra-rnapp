@@ -10,7 +10,8 @@ What this repo is today:
   - **`META` (`pkt = 1`):** after capture — **`window_id`**, **`sample_count`**, **`total_bytes`**, **IEEE CRC-32** over the full packed buffer (see **`bleRecordingProtocol.ts`**).
   The phone **does not** stream the IMU blob over notify; it **GATT-pulls** by writing a **32-bit little-endian offset** to **`ADAB0004`** and reading slices from **`ADAB0005`** until **`total_bytes`** match **META**, then **CRC + decode**. Partial or CRC-failed pulls are **rolled back** in UI.
 - **Link UI:** **`BleLinkStatusBadge.tsx`** shows a compact capsule (**Gluestack Badge**-style): animated orb (≤30% width) + status label (**Connecting**, **Connected**, **Linked**, **Recording**, **Processing**, **Retry**, **Disconnected**). Tap the orb for a short detail **toast** (session/RSSI/GATT copy). After the byte pull completes, the badge shows **Processing** while **`finalizeRecordingFromPull`** verifies CRC and unpacks samples before the timeline appears.
-- **Recording UI:** Verified recordings show a **Recording timeline** card with **[Gluestack Tabs](https://gluestack.io/ui)** switching SVG charts in **`RecordingTimelineCharts.tsx`**: **ACC RAW**, **GYRO RAW**, **ACC MAG** (‖a‖), **GYRO MAG** (‖ω‖), **COMPARE** (min–max normalized ‖a‖ vs ‖ω‖). A **window time** strip shows **`t_ms`** range from the samples (nominal **index × 5 ms** on the MCU—see firmware README); it is **not** BLE transfer duration. **Crop timeline** sliders use **`@react-native-community/slider`** (run **`bundle exec pod install`** under **`ios/`** after install).
+- **Recording UI:** Verified recordings show a **Recording timeline** card with **[Gluestack Tabs](https://gluestack.io/ui)** switching SVG charts in **`RecordingTimelineCharts.tsx`**: **ACC RAW**, **GYRO RAW**, **ACC MAG** (‖a‖), **GYRO MAG** (‖ω‖), **ALL MAG** (‖a‖ and ‖ω‖ each min–max normalized to 0…1 for shape comparison), **ALL RAW** (six raw axes each min–max normalized the same way). A **window time** strip shows **`t_ms`** range from the samples (nominal **index × 5 ms** on the MCU—see firmware README); it is **not** BLE transfer duration. **Crop timeline** sliders use **`@react-native-community/slider`** (run **`bundle exec pod install`** under **`ios/`** after install).
+- **Gesture ML flow:** The app’s decoded recording shape is the source of truth for **`abracadabra_gesture_processing`**. A recording is **`{ windowId, samples: [{ t_ms, ax, ay, az, gx, gy, gz }] }`**. Cropped timeline windows can be labeled as **`tap`**, **`double_tap`**, **`still`** / **silence**, or **`wrist_rotation`** and uploaded as JSON training samples. Full 3–4 s recordings can later be sent to **`POST /api/recordings/analyze`** so the server returns timed gesture-password segments (`movement_type`, `start_ms`, `end_ms`, `confidence`). `t_ms` / `windowId` are metadata for ordering, timing, tracing, and UI mapping—not model features.
 - **Native integration:** Safe area uses **`react-native-safe-area-context`** (`useSafeAreaInsets`), not deprecated RN `SafeAreaView`. **Skia** is used for the **NeonBackdrop** gradient (main hero orb was replaced by the link badge).
 - **Install / Metro:** **`.npmrc`** sets **`legacy-peer-deps=true`** so Gluestack’s peer graph resolves cleanly. **`metro.config.js`** aliases **`react-dom`** to **`rn-shims/react-dom`** because Gluestack pulls **react-aria**, which expects **`flushSync`** from `react-dom` (not shipped on React Native).
 
@@ -28,6 +29,17 @@ This app uses [**react-native-ble-plx**](https://github.com/dotintent/react-nati
 ### Pairing with **abracadabra-platformio**
 
 Firmware exposes `kBleDeviceName` (e.g. **XA_Abracadabra**), service **`ADAB0001-0000-1000-8000-00805F9B34FB`**, **RECORDING_PENDING** + **META** on **`ADAB0003-…`**, pull control **`ADAB0004-…`**, pull data **`ADAB0005-…`** (see firmware README).
+
+### Pairing with **abracadabra_gesture_processing**
+
+The gesture server is a JSON-only FastAPI service intended to consume this app’s decoded samples directly:
+
+- **Training crop:** `POST /api/training-samples` with `movement_type` + `window_id` + `samples`.
+- **Train model:** `POST /api/train` after collecting enough labeled crops.
+- **Classify one crop:** `POST /api/recordings/classify`.
+- **Analyze gesture password recording:** `POST /api/recordings/analyze` with a full 3–4 s recording.
+
+The server stores JSON training samples on its Railway volume and trains a Random Forest baseline on raw BLE-axis values, so training and inference should use the same raw sample units.
 
 ### Scan list: name vs UUID (iOS)
 
