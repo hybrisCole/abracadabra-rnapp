@@ -11,7 +11,7 @@ What this repo is today:
   The phone **does not** stream the IMU blob over notify; it **GATT-pulls** by writing a **32-bit little-endian offset** to **`ADAB0004`** and reading slices from **`ADAB0005`** until **`total_bytes`** match **META**, then **CRC + decode**. Partial or CRC-failed pulls are **rolled back** in UI.
 - **Link UI:** **`BleLinkStatusBadge.tsx`** shows a compact capsule (**Gluestack Badge**-style): animated orb (≤30% width) + status label (**Connecting**, **Connected**, **Linked**, **Recording**, **Processing**, **Retry**, **Disconnected**). Tap the orb for a short detail **toast** (session/RSSI/GATT copy). After the byte pull completes, the badge shows **Processing** while **`finalizeRecordingFromPull`** verifies CRC and unpacks samples before the timeline appears.
 - **Recording UI:** Verified recordings show a **Recording timeline** card with **[Gluestack Tabs](https://gluestack.io/ui)** switching SVG charts in **`RecordingTimelineCharts.tsx`**: **ACC RAW**, **GYRO RAW**, **ACC MAG** (‖a‖), **GYRO MAG** (‖ω‖), **ALL MAG** (‖a‖ and ‖ω‖ each min–max normalized to 0…1 for shape comparison), **ALL RAW** (six raw axes each min–max normalized the same way). A **window time** strip shows **`t_ms`** range from the samples (nominal **index × 5 ms** on the MCU—see firmware README); it is **not** BLE transfer duration. **Crop timeline** sliders use **`@react-native-community/slider`** (run **`bundle exec pod install`** under **`ios/`** after install).
-- **Gesture ML flow:** The app’s decoded recording shape is the source of truth for **`abracadabra_gesture_processing`**. A recording is **`{ windowId, samples: [{ t_ms, ax, ay, az, gx, gy, gz }] }`**. Cropped timeline windows can be labeled as **`tap`**, **`double_tap`**, **`still`** / **silence**, or **`wrist_rotation`** and uploaded as JSON training samples. Full 3–4 s recordings can later be sent to **`POST /api/recordings/analyze`** so the server returns timed gesture-password segments (`movement_type`, `start_ms`, `end_ms`, `confidence`). `t_ms` / `windowId` are metadata for ordering, timing, tracing, and UI mapping—not model features.
+- **Gesture ML flow:** The app’s decoded recording shape is the source of truth for **`abracadabra_gesture_processing`**. A recording is **`{ windowId, samples: [{ t_ms, ax, ay, az, gx, gy, gz }] }`**. Cropped timeline windows can be labeled as **`tap`**, **`double_tap`**, **`still`** / **silence**, or **`wrist_rotation`** and uploaded as JSON training samples. The app can refresh server/model status, train the Random Forest model, classify a selected crop, analyze a full 3–4 s recording into timed segments (`movement_type`, `start_ms`, `end_ms`, `confidence`), and compare the non-`still` detected sequence against an in-memory gesture password. `t_ms` / `windowId` are metadata for ordering, timing, tracing, and UI mapping—not model features.
 - **Native integration:** Safe area uses **`react-native-safe-area-context`** (`useSafeAreaInsets`), not deprecated RN `SafeAreaView`. **Skia** is used for the **NeonBackdrop** gradient (main hero orb was replaced by the link badge).
 - **Install / Metro:** **`.npmrc`** sets **`legacy-peer-deps=true`** so Gluestack’s peer graph resolves cleanly. **`metro.config.js`** aliases **`react-dom`** to **`rn-shims/react-dom`** because Gluestack pulls **react-aria**, which expects **`flushSync`** from `react-dom` (not shipped on React Native).
 
@@ -34,12 +34,14 @@ Firmware exposes `kBleDeviceName` (e.g. **XA_Abracadabra**), service **`ADAB0001
 
 The gesture server is a JSON-only FastAPI service intended to consume this app’s decoded samples directly:
 
+- **Base URL:** `gestureApi.ts` currently points at `https://abracadabragestureprocessing-production.up.railway.app`.
 - **Training crop:** `POST /api/training-samples` with `movement_type` + `window_id` + `samples`.
+- **Training status:** `GET /api/training-samples` and `GET /api/model-status`.
 - **Train model:** `POST /api/train` after collecting enough labeled crops.
 - **Classify one crop:** `POST /api/recordings/classify`.
 - **Analyze gesture password recording:** `POST /api/recordings/analyze` with a full 3–4 s recording.
 
-The server stores JSON training samples on its Railway volume and trains a Random Forest baseline on raw BLE-axis values, so training and inference should use the same raw sample units.
+The Classify workflow uses the recording timeline crop sliders to stage samples, choose a label, upload training crops, and classify the staged crop after the model is trained. The full-recording analysis workflow sends the entire latest recording to the server, renders the returned timed segments, filters out `still` / `silence`, and displays the simplified gesture sequence. The current password comparison is local and in-memory: save the detected non-`still` sequence as the expected password, then analyze later recordings to show match/mismatch. The server stores JSON training samples and the trained Random Forest model on its Railway volume, so training and inference should use the same raw sample units.
 
 ### Scan list: name vs UUID (iOS)
 
@@ -51,7 +53,7 @@ The long **`device.id`** line (UUID format) is **Apple’s peripheral identifier
 
 1. Connect the phone with USB and trust the computer.
 2. Open **`ios/AbracadabraRnApp.xcworkspace`** in Xcode → target **AbracadabraRnApp** → **Signing & Capabilities** → select your **Team**.
-3. From the project root (with Node 25: `source ~/.nvm/nvm.sh && nvm use 25`):
+3. From the project root (with Node 26: `source ~/.nvm/nvm.sh && nvm use 26`):
 
 ```sh
 npm start
@@ -69,8 +71,8 @@ Or pick your device and press Run in Xcode while Metro is running.
 
 Opening **`node_modules/.generated/launchPackager.command`** uses a bare shell — **`nvm` is not loaded**, so `node` is missing.
 
-- **Recommended:** from the project root, run `source ~/.nvm/nvm.sh && nvm use 25 && npm start`, or double‑click **`StartMetro.command`** in the repo root (same thing; executable wrapper).
-- **Xcode builds:** **`ios/.xcode.env.local`** sets **`NODE_BINARY`** after **`nvm use 25`** so Xcode’s shell scripts see `node`. That file is gitignored — start from **`ios/.xcode.env.local.example`** (`cp ios/.xcode.env.local.example ios/.xcode.env.local`) on a new clone.
+- **Recommended:** from the project root, run `source ~/.nvm/nvm.sh && nvm use 26 && npm start`, or double‑click **`StartMetro.command`** in the repo root (same thing; executable wrapper).
+- **Xcode builds:** **`ios/.xcode.env.local`** sets **`NODE_BINARY`** after **`nvm use 26`** so Xcode’s shell scripts see `node`. That file is gitignored — start from **`ios/.xcode.env.local.example`** (`cp ios/.xcode.env.local.example ios/.xcode.env.local`) on a new clone.
 
 # Getting Started
 

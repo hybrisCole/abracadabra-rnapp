@@ -41,8 +41,22 @@ import {
   type DecodedRecording,
 } from './bleRecordingProtocol';
 import {BleLinkStatusBadge, type LinkBadgeStatus} from './BleLinkStatusBadge';
+import {
+  type AnalyzeRecordingResponse,
+  gestureApi,
+  type ClassifyRecordingResponse,
+  type MovementType,
+  type ModelStatusResponse,
+  type PasswordMovementType,
+  type SaveTrainingSampleResponse,
+  segmentsToPasswordSequence,
+  type TrainingSamplesResponse,
+} from './gestureApi';
 import {NeonBackdrop} from './NeonBackdrop';
-import {RecordingTimelineCharts} from './RecordingTimelineCharts';
+import {
+  RecordingTimelineCharts,
+  type CropSelection,
+} from './RecordingTimelineCharts';
 
 const TARGET_BLE_NAME = 'XA_Abracadabra';
 const SCAN_DURATION_MS = 5000;
@@ -73,6 +87,52 @@ type ScanOutcome = 'idle' | 'scanning' | 'found' | 'not-found';
 
 type ConnPhase = 'off' | 'connecting' | 'linked' | 'error';
 
+type TrainingUploadState =
+  | {status: 'idle'}
+  | {status: 'saving'}
+  | {status: 'saved'; response: SaveTrainingSampleResponse}
+  | {status: 'error'; message: string};
+
+type ModelPanelState =
+  | {status: 'idle'}
+  | {status: 'loading'}
+  | {status: 'ready'; message?: string}
+  | {status: 'training'; message?: string}
+  | {status: 'error'; message: string};
+
+type CropClassificationState =
+  | {status: 'idle'}
+  | {status: 'classifying'}
+  | {status: 'classified'; response: ClassifyRecordingResponse}
+  | {status: 'error'; message: string};
+
+type RecordingAnalysisState =
+  | {status: 'idle'}
+  | {status: 'analyzing'}
+  | {status: 'analyzed'; response: AnalyzeRecordingResponse}
+  | {status: 'error'; message: string};
+
+const TRAINING_LABELS: {value: MovementType; label: string; helper: string}[] = [
+  {value: 'tap', label: 'Tap', helper: 'single hit'},
+  {value: 'double_tap', label: 'Double tap', helper: 'two hits'},
+  {value: 'wrist_rotation', label: 'Wrist rotate', helper: 'twist'},
+  {value: 'still', label: 'Still', helper: 'background'},
+];
+
+function formatGestureSequence(sequence: PasswordMovementType[]): string {
+  return sequence.length > 0 ? sequence.join(' → ') : 'no gesture';
+}
+
+function sequencesMatch(
+  detected: PasswordMovementType[],
+  expected: PasswordMovementType[],
+): boolean {
+  return (
+    detected.length === expected.length &&
+    detected.every((movement, index) => movement === expected[index])
+  );
+}
+
 function base64ToBytes(b64: string): Uint8Array {
   const atobFn = (globalThis as unknown as {atob: (s: string) => string}).atob;
   const binary = atobFn(b64);
@@ -86,6 +146,39 @@ function base64ToBytes(b64: string): Uint8Array {
 
 const formatRssi = (rssi: number | null) => (rssi == null ? '—' : `${rssi} dBm`);
 
+function formatErrorDetail(error: unknown): string {
+  if (error == null) {
+    return 'Unknown error';
+  }
+
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === 'string'
+        ? error
+        : 'Unknown error';
+  const maybe = error as Record<string, unknown>;
+  const details: string[] = [];
+  for (const [key, value] of [
+    ['reason', maybe.reason],
+    ['errorCode', maybe.errorCode],
+    ['attErrorCode', maybe.attErrorCode],
+    ['iosErrorCode', maybe.iosErrorCode],
+    ['androidErrorCode', maybe.androidErrorCode],
+  ] as const) {
+    if (value != null) {
+      details.push(`${key}=${String(value)}`);
+    }
+  }
+
+  return details.length > 0 ? `${message} (${details.join(', ')})` : message;
+}
+
+function isBleManagerDestroyedError(error: unknown): boolean {
+  const maybe = error as Record<string, unknown>;
+  return maybe.reason === 'BleManager was destroyed';
+}
+
 const isTargetName = (name: string | null | undefined) => name === TARGET_BLE_NAME;
 
 const isTargetDevice = (device: {
@@ -95,6 +188,7 @@ const isTargetDevice = (device: {
 
 function AbracadabraScreen(): React.JSX.Element {
   const managerRef = useRef<BleManager | null>(null);
+  const managerDestroyedRef = useRef(false);
   const scanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pulse = useRef(new Animated.Value(0)).current;
   const feedbackOutcomeRef = useRef<ScanOutcome>('idle');
@@ -124,6 +218,30 @@ function AbracadabraScreen(): React.JSX.Element {
   const [lastRecording, setLastRecording] = useState<DecodedRecording | null>(
     null,
   );
+  const [selectedCrop, setSelectedCrop] = useState<CropSelection | null>(null);
+  const [selectedMovement, setSelectedMovement] = useState<MovementType>('tap');
+  const [trainingUpload, setTrainingUpload] = useState<TrainingUploadState>({
+    status: 'idle',
+  });
+  const [modelStatus, setModelStatus] = useState<ModelStatusResponse | null>(
+    null,
+  );
+  const [trainingSamples, setTrainingSamples] =
+    useState<TrainingSamplesResponse | null>(null);
+  const [modelPanel, setModelPanel] = useState<ModelPanelState>({
+    status: 'idle',
+  });
+  const [cropClassification, setCropClassification] =
+    useState<CropClassificationState>({
+      status: 'idle',
+    });
+  const [recordingAnalysis, setRecordingAnalysis] =
+    useState<RecordingAnalysisState>({
+      status: 'idle',
+    });
+  const [savedPasswordSequence, setSavedPasswordSequence] = useState<
+    PasswordMovementType[]
+  >([]);
 
   const [targetDevice, setTargetDevice] = useState<DeviceRow | null>(null);
   const [scanning, setScanning] = useState(false);
@@ -138,6 +256,7 @@ function AbracadabraScreen(): React.JSX.Element {
   useEffect(() => {
     const mgr = new BleManager();
     managerRef.current = mgr;
+    managerDestroyedRef.current = false;
 
     const sub = mgr.onStateChange(state => {
       setBleState(state);
@@ -152,7 +271,12 @@ function AbracadabraScreen(): React.JSX.Element {
         clearTimeout(scanTimerRef.current);
         scanTimerRef.current = null;
       }
-      mgr.stopDeviceScan().catch(() => {});
+      mgr.stopDeviceScan().catch(error => {
+        if (__DEV__ && !isBleManagerDestroyedError(error)) {
+          console.warn('[BLE scan cleanup]', formatErrorDetail(error), error);
+        }
+      });
+      managerDestroyedRef.current = true;
       mgr.destroy();
       managerRef.current = null;
     };
@@ -186,7 +310,11 @@ function AbracadabraScreen(): React.JSX.Element {
     }
     const mgr = managerRef.current;
     if (mgr) {
-      mgr.stopDeviceScan().catch(() => {});
+      mgr.stopDeviceScan().catch(error => {
+        if (__DEV__) {
+          console.warn('[BLE stop scan]', formatErrorDetail(error), error);
+        }
+      });
     }
     setScanning(false);
     setHasScanned(true);
@@ -218,7 +346,7 @@ function AbracadabraScreen(): React.JSX.Element {
 
     mgr.startDeviceScan(null, null, (error, device) => {
       if (error) {
-        console.error(error.message);
+        console.error('[BLE scan]', formatErrorDetail(error), error);
         return;
       }
       if (!device) {
@@ -246,7 +374,15 @@ function AbracadabraScreen(): React.JSX.Element {
         clearTimeout(scanTimerRef.current);
         scanTimerRef.current = null;
       }
-      mgr.stopDeviceScan().catch(() => {});
+      mgr.stopDeviceScan().catch(stopError => {
+        if (__DEV__) {
+          console.warn(
+            '[BLE scan found cleanup]',
+            formatErrorDetail(stopError),
+            stopError,
+          );
+        }
+      });
       setScanning(false);
       setHasScanned(true);
     });
@@ -254,7 +390,11 @@ function AbracadabraScreen(): React.JSX.Element {
     scanTimerRef.current = setTimeout(() => {
       scanTimerRef.current = null;
       if (mgr) {
-        mgr.stopDeviceScan().catch(() => {});
+        mgr.stopDeviceScan().catch(error => {
+          if (__DEV__) {
+            console.warn('[BLE scan timeout cleanup]', formatErrorDetail(error), error);
+          }
+        });
       }
       setScanning(false);
       setHasScanned(true);
@@ -295,7 +435,17 @@ function AbracadabraScreen(): React.JSX.Element {
           timeout: 12000,
         });
         if (cancelled) {
-          await dev.cancelConnection();
+          if (!managerDestroyedRef.current) {
+            dev.cancelConnection().catch(error => {
+              if (__DEV__ && !isBleManagerDestroyedError(error)) {
+                console.warn(
+                  '[BLE cancelled connect cleanup]',
+                  formatErrorDetail(error),
+                  error,
+                );
+              }
+            });
+          }
           return;
         }
 
@@ -350,7 +500,7 @@ function AbracadabraScreen(): React.JSX.Element {
             }
             if (error != null) {
               if (__DEV__) {
-                console.warn('[BLE notify]', error.message);
+                console.warn('[BLE notify]', formatErrorDetail(error), error);
               }
               return;
             }
@@ -408,7 +558,15 @@ function AbracadabraScreen(): React.JSX.Element {
                   setProcessingCapture(false);
                   if ('error' in fin) {
                     setTransferNote(fin.error);
+                    setRecvProgress(null);
+                    setWearableCaptureArming(null);
+                    setConnPhase('linked');
+                    assemblerRef.current.reset('finalize failed');
                   } else {
+                    setSelectedCrop(null);
+                    setTrainingUpload({status: 'idle'});
+                    setCropClassification({status: 'idle'});
+                    setRecordingAnalysis({status: 'idle'});
                     setLastRecording(fin);
                     setTransferNote(null);
                     Vibration.vibrate([0, 30, 50, 90, 40, 120]);
@@ -417,10 +575,13 @@ function AbracadabraScreen(): React.JSX.Element {
                 .catch(e => {
                   setRecvProgress(null);
                   setProcessingCapture(false);
+                  setWearableCaptureArming(null);
+                  setConnPhase('linked');
+                  assemblerRef.current.reset('pull failed');
                   const msg = e instanceof Error ? e.message : String(e);
                   setTransferNote(msg);
                   if (__DEV__) {
-                    console.warn('[BLE pull]', e);
+                    console.warn('[BLE pull]', formatErrorDetail(e), e);
                   }
                 })
                 .finally(() => {
@@ -443,7 +604,7 @@ function AbracadabraScreen(): React.JSX.Element {
         }
       } catch (e) {
         if (!cancelled && __DEV__) {
-          console.warn('[BLE connect]', e);
+          console.warn('[BLE connect]', formatErrorDetail(e), e);
         }
         if (!cancelled) {
           setConnPhase('error');
@@ -463,8 +624,12 @@ function AbracadabraScreen(): React.JSX.Element {
       const d = connectedDevRef.current;
       connectedDevRef.current = null;
       assemblerForCleanup.reset('effect cleanup');
-      if (d != null) {
-        d.cancelConnection().catch(() => {});
+      if (d != null && !managerDestroyedRef.current) {
+        d.cancelConnection().catch(error => {
+          if (__DEV__ && !isBleManagerDestroyedError(error)) {
+            console.warn('[BLE effect cleanup]', formatErrorDetail(error), error);
+          }
+        });
       }
       setRecvProgress(null);
       setWearableCaptureArming(null);
@@ -604,6 +769,194 @@ function AbracadabraScreen(): React.JSX.Element {
     reconnectAttempt,
   ]);
 
+  const handleCropSelected = useCallback((selection: CropSelection): void => {
+    setSelectedCrop(selection);
+    setTrainingUpload({status: 'idle'});
+    setCropClassification({status: 'idle'});
+  }, []);
+
+  const refreshModelInfo = useCallback(async (): Promise<void> => {
+    setModelPanel({status: 'loading'});
+    try {
+      const [nextModelStatus, nextTrainingSamples] = await Promise.all([
+        gestureApi.getModelStatus(),
+        gestureApi.listTrainingSamples(),
+      ]);
+      if (__DEV__) {
+        console.log('[ModelStatus] refreshed', {
+          model: nextModelStatus,
+          training: nextTrainingSamples,
+        });
+      }
+      setModelStatus(nextModelStatus);
+      setTrainingSamples(nextTrainingSamples);
+      setModelPanel({status: 'ready'});
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Model status refresh failed';
+      if (__DEV__) {
+        console.warn('[ModelStatus] refresh failed', formatErrorDetail(error), error);
+      }
+      setModelPanel({status: 'error', message});
+    }
+  }, []);
+
+  const trainModel = useCallback(async (): Promise<void> => {
+    setModelPanel({status: 'training', message: 'Training model...'});
+    try {
+      const response = await gestureApi.trainModel();
+      if (__DEV__) {
+        console.log('[ModelStatus] train requested', response);
+      }
+      setModelPanel({status: 'ready', message: response.message});
+      await refreshModelInfo();
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Model training request failed';
+      if (__DEV__) {
+        console.warn('[ModelStatus] train failed', formatErrorDetail(error), error);
+      }
+      setModelPanel({status: 'error', message});
+    }
+  }, [refreshModelInfo]);
+
+  const uploadSelectedCrop = useCallback(async (): Promise<void> => {
+    if (selectedCrop == null || selectedCrop.samplesInCrop < 10) {
+      setTrainingUpload({
+        status: 'error',
+        message: 'Select a crop with at least 10 samples before uploading.',
+      });
+      return;
+    }
+
+    setTrainingUpload({status: 'saving'});
+    try {
+      const response = await gestureApi.saveTrainingSample({
+        movement_type: selectedMovement,
+        window_id: selectedCrop.windowId,
+        samples: selectedCrop.samples,
+      });
+      if (__DEV__) {
+        console.log('[TrainingUpload] saved', response);
+      }
+      setTrainingUpload({status: 'saved', response});
+      refreshModelInfo().catch(error => {
+        if (__DEV__) {
+          console.warn(
+            '[ModelStatus] post-upload refresh failed',
+            formatErrorDetail(error),
+            error,
+          );
+        }
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Training upload failed';
+      if (__DEV__) {
+        console.warn('[TrainingUpload] failed', formatErrorDetail(error), error);
+      }
+      setTrainingUpload({status: 'error', message});
+    }
+  }, [refreshModelInfo, selectedCrop, selectedMovement]);
+
+  const classifySelectedCrop = useCallback(async (): Promise<void> => {
+    if (selectedCrop == null || selectedCrop.samplesInCrop < 10) {
+      setCropClassification({
+        status: 'error',
+        message: 'Select a crop with at least 10 samples before classifying.',
+      });
+      return;
+    }
+
+    setCropClassification({status: 'classifying'});
+    try {
+      const response = await gestureApi.classifyRecording({
+        window_id: selectedCrop.windowId,
+        samples: selectedCrop.samples,
+      });
+      if (__DEV__) {
+        console.log('[CropClassification] classified', response);
+      }
+      setCropClassification({status: 'classified', response});
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Crop classification failed';
+      if (__DEV__) {
+        console.warn(
+          '[CropClassification] failed',
+          formatErrorDetail(error),
+          error,
+        );
+      }
+      setCropClassification({status: 'error', message});
+    }
+  }, [selectedCrop]);
+
+  const analyzeLastRecording = useCallback(async (): Promise<void> => {
+    if (lastRecording == null || lastRecording.samples.length < 10) {
+      setRecordingAnalysis({
+        status: 'error',
+        message: 'Receive a recording with at least 10 samples before analyzing.',
+      });
+      return;
+    }
+
+    setRecordingAnalysis({status: 'analyzing'});
+    try {
+      const response = await gestureApi.analyzeRecording({
+        window_id: lastRecording.windowId,
+        samples: lastRecording.samples,
+        include_still: true,
+      });
+      if (__DEV__) {
+        console.log('[RecordingAnalysis] analyzed', response);
+      }
+      setRecordingAnalysis({status: 'analyzed', response});
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Recording analysis failed';
+      if (__DEV__) {
+        console.warn(
+          '[RecordingAnalysis] failed',
+          formatErrorDetail(error),
+          error,
+        );
+      }
+      setRecordingAnalysis({status: 'error', message});
+    }
+  }, [lastRecording]);
+
+  const detectedPasswordSequence = useMemo(
+    () =>
+      recordingAnalysis.status === 'analyzed'
+        ? segmentsToPasswordSequence(recordingAnalysis.response.segments)
+        : [],
+    [recordingAnalysis],
+  );
+
+  const passwordMatched =
+    savedPasswordSequence.length > 0 &&
+    sequencesMatch(detectedPasswordSequence, savedPasswordSequence);
+
+  const saveAnalyzedSequenceAsPassword = useCallback((): void => {
+    if (detectedPasswordSequence.length === 0) {
+      return;
+    }
+    setSavedPasswordSequence(detectedPasswordSequence);
+  }, [detectedPasswordSequence]);
+
+  useEffect(() => {
+    refreshModelInfo().catch(error => {
+      if (__DEV__) {
+        console.warn(
+          '[ModelStatus] initial refresh failed',
+          formatErrorDetail(error),
+          error,
+        );
+      }
+    });
+  }, [refreshModelInfo]);
+
   useEffect(() => {
     if (feedbackOutcomeRef.current === scanOutcome) {
       return;
@@ -691,10 +1044,565 @@ function AbracadabraScreen(): React.JSX.Element {
                 <RecordingTimelineCharts
                   samples={lastRecording.samples}
                   windowId={lastRecording.windowId}
+                  onCropSelected={handleCropSelected}
                 />
+              </Box>
+              {selectedCrop != null ? (
+                <Box
+                  mt="$4"
+                  p="$3"
+                  borderRadius="$xl"
+                  borderWidth={1}
+                  borderColor="rgba(217,70,239,0.45)"
+                  bg="rgba(88,28,135,0.22)">
+                  <Text
+                    color="#f9a8d4"
+                    fontSize="$xs"
+                    fontWeight="$extrabold"
+                    letterSpacing="$lg"
+                    textTransform="uppercase">
+                    Selected crop
+                  </Text>
+                  <Text mt="$2" color="#e0f2fe" fontFamily="Menlo" fontSize="$sm">
+                    {selectedCrop.cropStartMs}–{selectedCrop.cropEndMs} ms ·{' '}
+                    {selectedCrop.durationMs} ms · {selectedCrop.samplesInCrop}{' '}
+                    / {selectedCrop.samplesTotal} samples
+                  </Text>
+                  <Text mt="$1" color="#94a3b8" fontFamily="Menlo" fontSize="$xs">
+                    first {selectedCrop.tMsFirstInCrop ?? 'n/a'} ms · last{' '}
+                    {selectedCrop.tMsLastInCrop ?? 'n/a'} ms
+                  </Text>
+                  <Text
+                    mt="$4"
+                    color="#f9a8d4"
+                    fontSize="$xs"
+                    fontWeight="$extrabold"
+                    letterSpacing="$lg"
+                    textTransform="uppercase">
+                    Training label
+                  </Text>
+                  <Box
+                    mt="$2"
+                    flexDirection="row"
+                    flexWrap="wrap"
+                    gap="$2">
+                    {TRAINING_LABELS.map(label => {
+                      const active = selectedMovement === label.value;
+                      const isStill = label.value === 'still';
+                      return (
+                        <Button
+                          key={label.value}
+                          size="sm"
+                          variant="outline"
+                          borderRadius="$full"
+                          borderColor={
+                            active
+                              ? isStill
+                                ? 'rgba(148,163,184,0.9)'
+                                : 'rgba(34,211,238,0.95)'
+                              : 'rgba(148,163,184,0.32)'
+                          }
+                          bg={
+                            active
+                              ? isStill
+                                ? 'rgba(71,85,105,0.42)'
+                                : 'rgba(8,145,178,0.32)'
+                              : 'rgba(15,23,42,0.62)'
+                          }
+                          onPress={() => {
+                            setSelectedMovement(label.value);
+                            setTrainingUpload({status: 'idle'});
+                            setCropClassification({status: 'idle'});
+                          }}>
+                          <ButtonText
+                            color={
+                              active
+                                ? isStill
+                                  ? '#cbd5e1'
+                                  : '#67e8f9'
+                                : '#94a3b8'
+                            }
+                            fontSize="$xs"
+                            fontWeight="$extrabold"
+                            textTransform="uppercase">
+                            {label.label}
+                          </ButtonText>
+                        </Button>
+                      );
+                    })}
+                  </Box>
+                  <Text mt="$2" color="#94a3b8" fontFamily="Menlo" fontSize="$xs">
+                    {TRAINING_LABELS.find(
+                      label => label.value === selectedMovement,
+                    )?.helper ?? 'gesture'}{' '}
+                    · still is training background, not a password gesture
+                  </Text>
+                  <HStack mt="$4" space="sm" alignItems="center">
+                    <Button
+                      flex={1}
+                      size="sm"
+                      borderRadius="$xl"
+                      bg="#00f5ff"
+                      isDisabled={
+                        trainingUpload.status === 'saving' ||
+                        selectedCrop.samplesInCrop < 10
+                      }
+                      opacity={
+                        trainingUpload.status === 'saving' ||
+                        selectedCrop.samplesInCrop < 10
+                          ? 0.55
+                          : 1
+                      }
+                      onPress={uploadSelectedCrop}>
+                      <ButtonText
+                        color="#020617"
+                        fontWeight="$extrabold"
+                        letterSpacing="$md"
+                        fontSize="$xs"
+                        textTransform="uppercase">
+                        {trainingUpload.status === 'saving'
+                          ? 'Uploading...'
+                          : 'Upload crop'}
+                      </ButtonText>
+                    </Button>
+                    <Button
+                      flex={1}
+                      size="sm"
+                      variant="outline"
+                      borderRadius="$xl"
+                      borderColor="rgba(217,70,239,0.75)"
+                      bg="rgba(15,23,42,0.72)"
+                      isDisabled={
+                        cropClassification.status === 'classifying' ||
+                        selectedCrop.samplesInCrop < 10 ||
+                        modelStatus?.status !== 'trained'
+                      }
+                      opacity={
+                        cropClassification.status === 'classifying' ||
+                        selectedCrop.samplesInCrop < 10 ||
+                        modelStatus?.status !== 'trained'
+                          ? 0.55
+                          : 1
+                      }
+                      onPress={classifySelectedCrop}>
+                      <ButtonText
+                        color="#f0abfc"
+                        fontWeight="$extrabold"
+                        letterSpacing="$md"
+                        fontSize="$xs"
+                        textTransform="uppercase">
+                        {cropClassification.status === 'classifying'
+                          ? 'Classifying...'
+                          : 'Classify crop'}
+                      </ButtonText>
+                    </Button>
+                  </HStack>
+                  {trainingUpload.status === 'saved' ? (
+                    <Text
+                      mt="$3"
+                      color="#a7f3d0"
+                      fontFamily="Menlo"
+                      fontSize="$xs">
+                      Saved {trainingUpload.response.movement_type} sample{' '}
+                      {trainingUpload.response.sample_id} ·{' '}
+                      {trainingUpload.response.sample_count} samples
+                    </Text>
+                  ) : null}
+                  {trainingUpload.status === 'error' ? (
+                    <Text
+                      mt="$3"
+                      color="#fecdd3"
+                      fontFamily="Menlo"
+                      fontSize="$xs">
+                      {trainingUpload.message}
+                    </Text>
+                  ) : null}
+                  {cropClassification.status === 'classified' ? (
+                    <Box
+                      mt="$4"
+                      p="$3"
+                      borderRadius="$lg"
+                      borderWidth={1}
+                      borderColor="rgba(34,211,238,0.42)"
+                      bg="rgba(8,47,73,0.26)">
+                      <Text
+                        color="#67e8f9"
+                        fontSize="$xs"
+                        fontWeight="$extrabold"
+                        letterSpacing="$lg"
+                        textTransform="uppercase">
+                        Prediction
+                      </Text>
+                      <Text
+                        mt="$2"
+                        color="#e0f2fe"
+                        fontFamily="Menlo"
+                        fontSize="$sm">
+                        {cropClassification.response.predicted_movement} ·{' '}
+                        {Math.round(cropClassification.response.confidence * 100)}
+                        %
+                      </Text>
+                      <Box mt="$2" flexDirection="row" flexWrap="wrap" gap="$2">
+                        {Object.entries(
+                          cropClassification.response.all_probabilities,
+                        )
+                          .sort(([, a], [, b]) => (b ?? 0) - (a ?? 0))
+                          .slice(0, 4)
+                          .map(([movement, probability]) => (
+                            <Text
+                              key={movement}
+                              color="#94a3b8"
+                              fontFamily="Menlo"
+                              fontSize="$xs">
+                              {movement}:{' '}
+                              {Math.round((probability ?? 0) * 100)}%
+                            </Text>
+                          ))}
+                      </Box>
+                    </Box>
+                  ) : null}
+                  {cropClassification.status === 'error' ? (
+                    <Text
+                      mt="$3"
+                      color="#fecdd3"
+                      fontFamily="Menlo"
+                      fontSize="$xs">
+                      {cropClassification.message}
+                    </Text>
+                  ) : null}
+                </Box>
+              ) : (
+                <Text mt="$3" color="#94a3b8" fontSize="$sm" fontFamily="Menlo">
+                  Move the crop sliders and tap Select crop to stage samples for
+                  labeling.
+                </Text>
+              )}
+              <Box
+                mt="$4"
+                p="$3"
+                borderRadius="$xl"
+                borderWidth={1}
+                borderColor="rgba(34,211,238,0.28)"
+                bg="rgba(8,47,73,0.18)">
+                <HStack justifyContent="space-between" alignItems="center">
+                  <Text
+                    color="#67e8f9"
+                    fontSize="$xs"
+                    fontWeight="$extrabold"
+                    letterSpacing="$lg"
+                    textTransform="uppercase">
+                    Full recording analysis
+                  </Text>
+                  <Text color="#94a3b8" fontFamily="Menlo" fontSize="$xs">
+                    {lastRecording.samples.length} samples
+                  </Text>
+                </HStack>
+                <Button
+                  mt="$3"
+                  size="sm"
+                  alignSelf="flex-start"
+                  borderRadius="$xl"
+                  bg="#d946ef"
+                  isDisabled={
+                    recordingAnalysis.status === 'analyzing' ||
+                    modelStatus?.status !== 'trained'
+                  }
+                  opacity={
+                    recordingAnalysis.status === 'analyzing' ||
+                    modelStatus?.status !== 'trained'
+                      ? 0.55
+                      : 1
+                  }
+                  onPress={analyzeLastRecording}>
+                  <ButtonText
+                    color="#020617"
+                    fontWeight="$extrabold"
+                    letterSpacing="$md"
+                    fontSize="$xs"
+                    textTransform="uppercase">
+                    {recordingAnalysis.status === 'analyzing'
+                      ? 'Analyzing...'
+                      : 'Analyze full recording'}
+                  </ButtonText>
+                </Button>
+                {recordingAnalysis.status === 'analyzed' ? (
+                  <Box mt="$4">
+                    <Text
+                      color="#e0f2fe"
+                      fontFamily="Menlo"
+                      fontSize="$sm">
+                      Sequence: {formatGestureSequence(detectedPasswordSequence)}
+                    </Text>
+                    <Text mt="$1" color="#94a3b8" fontFamily="Menlo" fontSize="$xs">
+                      {recordingAnalysis.response.duration_ms} ms ·{' '}
+                      {recordingAnalysis.response.sample_rate_hz.toFixed(1)} Hz ·{' '}
+                      {recordingAnalysis.response.segments.length} segments
+                    </Text>
+                    <Box
+                      mt="$3"
+                      p="$3"
+                      borderRadius="$lg"
+                      borderWidth={1}
+                      borderColor={
+                        savedPasswordSequence.length === 0
+                          ? 'rgba(148,163,184,0.3)'
+                          : passwordMatched
+                            ? 'rgba(16,185,129,0.55)'
+                            : 'rgba(251,113,133,0.5)'
+                      }
+                      bg={
+                        savedPasswordSequence.length === 0
+                          ? 'rgba(15,23,42,0.55)'
+                          : passwordMatched
+                            ? 'rgba(6,78,59,0.22)'
+                            : 'rgba(127,29,29,0.2)'
+                      }>
+                      <Text
+                        color={
+                          savedPasswordSequence.length === 0
+                            ? '#94a3b8'
+                            : passwordMatched
+                              ? '#a7f3d0'
+                              : '#fecdd3'
+                        }
+                        fontFamily="Menlo"
+                        fontSize="$xs">
+                        {savedPasswordSequence.length === 0
+                          ? 'No password saved yet'
+                          : passwordMatched
+                            ? 'Password match'
+                            : 'Password mismatch'}
+                      </Text>
+                      {savedPasswordSequence.length > 0 ? (
+                        <Text
+                          mt="$1"
+                          color="#94a3b8"
+                          fontFamily="Menlo"
+                          fontSize="$xs">
+                          Expected: {formatGestureSequence(savedPasswordSequence)}
+                        </Text>
+                      ) : null}
+                      <HStack mt="$3" space="sm" alignItems="center">
+                        <Button
+                          flex={1}
+                          size="sm"
+                          borderRadius="$xl"
+                          bg="#00f5ff"
+                          isDisabled={detectedPasswordSequence.length === 0}
+                          opacity={detectedPasswordSequence.length === 0 ? 0.55 : 1}
+                          onPress={saveAnalyzedSequenceAsPassword}>
+                          <ButtonText
+                            color="#020617"
+                            fontWeight="$extrabold"
+                            letterSpacing="$md"
+                            fontSize="$xs"
+                            textTransform="uppercase">
+                            Save as password
+                          </ButtonText>
+                        </Button>
+                        <Button
+                          flex={1}
+                          size="sm"
+                          variant="outline"
+                          borderRadius="$xl"
+                          borderColor="rgba(148,163,184,0.45)"
+                          bg="rgba(15,23,42,0.72)"
+                          isDisabled={savedPasswordSequence.length === 0}
+                          opacity={savedPasswordSequence.length === 0 ? 0.55 : 1}
+                          onPress={() => setSavedPasswordSequence([])}>
+                          <ButtonText
+                            color="#cbd5e1"
+                            fontWeight="$extrabold"
+                            letterSpacing="$md"
+                            fontSize="$xs"
+                            textTransform="uppercase">
+                            Clear password
+                          </ButtonText>
+                        </Button>
+                      </HStack>
+                    </Box>
+                    <Box mt="$3" gap="$2">
+                      {recordingAnalysis.response.segments.map(segment => (
+                        <HStack
+                          key={`${segment.movement_type}-${segment.start_ms}-${segment.end_ms}`}
+                          justifyContent="space-between"
+                          alignItems="center"
+                          py="$1">
+                          <Text
+                            color={
+                              segment.movement_type === 'still'
+                                ? '#94a3b8'
+                                : '#f0abfc'
+                            }
+                            fontFamily="Menlo"
+                            fontSize="$xs">
+                            {segment.start_ms}–{segment.end_ms} ms ·{' '}
+                            {segment.movement_type}
+                          </Text>
+                          <Text color="#94a3b8" fontFamily="Menlo" fontSize="$xs">
+                            {Math.round(segment.confidence * 100)}%
+                          </Text>
+                        </HStack>
+                      ))}
+                    </Box>
+                  </Box>
+                ) : null}
+                {recordingAnalysis.status === 'error' ? (
+                  <Text mt="$3" color="#fecdd3" fontFamily="Menlo" fontSize="$xs">
+                    {recordingAnalysis.message}
+                  </Text>
+                ) : null}
               </Box>
             </Box>
           ) : null}
+
+          <Box
+            mt="$4"
+            p="$4"
+            borderRadius="$2xl"
+            borderWidth={1}
+            borderColor="rgba(148,163,184,0.24)"
+            bg="rgba(15,23,42,0.64)">
+            <HStack justifyContent="space-between" alignItems="center">
+              <Heading
+                size="xs"
+                color="$coolGray50"
+                fontWeight="$extrabold"
+                letterSpacing="$lg"
+                textTransform="uppercase">
+                Model / Server
+              </Heading>
+              <Text color="#94a3b8" fontFamily="Menlo" fontSize="$xs">
+                {modelPanel.status === 'error'
+                  ? 'offline'
+                  : modelPanel.status === 'idle' || modelPanel.status === 'loading'
+                    ? 'checking'
+                    : 'online'}
+              </Text>
+            </HStack>
+
+            <HStack mt="$3" space="sm" flexWrap="wrap">
+              <Box
+                px="$3"
+                py="$2"
+                borderRadius="$lg"
+                borderWidth={1}
+                borderColor="rgba(34,211,238,0.28)"
+                bg="rgba(8,47,73,0.28)">
+                <Text
+                  color="#67e8f9"
+                  fontSize="$xs"
+                  fontWeight="$extrabold"
+                  textTransform="uppercase">
+                  {modelStatus?.status === 'trained' ? 'Trained' : 'Not trained'}
+                </Text>
+              </Box>
+              <Box
+                px="$3"
+                py="$2"
+                borderRadius="$lg"
+                borderWidth={1}
+                borderColor="rgba(217,70,239,0.26)"
+                bg="rgba(88,28,135,0.22)">
+                <Text
+                  color="#f0abfc"
+                  fontSize="$xs"
+                  fontWeight="$extrabold"
+                  textTransform="uppercase">
+                  {trainingSamples?.total_samples ?? 0} samples
+                </Text>
+              </Box>
+            </HStack>
+
+            <Box mt="$3" flexDirection="row" flexWrap="wrap" gap="$2">
+              {TRAINING_LABELS.map(label => (
+                <Text
+                  key={label.value}
+                  color={label.value === 'still' ? '#cbd5e1' : '#e0f2fe'}
+                  fontFamily="Menlo"
+                  fontSize="$xs">
+                  {label.label}:{' '}
+                  {trainingSamples?.sample_counts[label.value] ?? 0}
+                </Text>
+              ))}
+            </Box>
+
+            {modelStatus?.status === 'trained' ? (
+              <Text mt="$2" color="#94a3b8" fontFamily="Menlo" fontSize="$xs">
+                Labels: {modelStatus.movements.join(' · ')}
+              </Text>
+            ) : null}
+
+            {modelPanel.status === 'ready' && modelPanel.message != null ? (
+              <Text mt="$2" color="#a7f3d0" fontFamily="Menlo" fontSize="$xs">
+                {modelPanel.message}
+              </Text>
+            ) : null}
+            {modelPanel.status === 'error' ? (
+              <Text mt="$2" color="#fecdd3" fontFamily="Menlo" fontSize="$xs">
+                {modelPanel.message}
+              </Text>
+            ) : null}
+
+            <HStack mt="$4" space="sm" alignItems="center">
+              <Button
+                flex={1}
+                size="sm"
+                variant="outline"
+                borderRadius="$xl"
+                borderColor="rgba(34,211,238,0.65)"
+                bg="rgba(15,23,42,0.7)"
+                isDisabled={
+                  modelPanel.status === 'loading' ||
+                  modelPanel.status === 'training'
+                }
+                opacity={
+                  modelPanel.status === 'loading' ||
+                  modelPanel.status === 'training'
+                    ? 0.55
+                    : 1
+                }
+                onPress={refreshModelInfo}>
+                <ButtonText
+                  color="#67e8f9"
+                  fontWeight="$extrabold"
+                  letterSpacing="$md"
+                  fontSize="$xs"
+                  textTransform="uppercase">
+                  {modelPanel.status === 'loading' ? 'Refreshing...' : 'Refresh'}
+                </ButtonText>
+              </Button>
+              <Button
+                flex={1}
+                size="sm"
+                borderRadius="$xl"
+                bg="#d946ef"
+                isDisabled={
+                  modelPanel.status === 'loading' ||
+                  modelPanel.status === 'training' ||
+                  (trainingSamples?.total_samples ?? 0) === 0
+                }
+                opacity={
+                  modelPanel.status === 'loading' ||
+                  modelPanel.status === 'training' ||
+                  (trainingSamples?.total_samples ?? 0) === 0
+                    ? 0.55
+                    : 1
+                }
+                onPress={trainModel}>
+                <ButtonText
+                  color="#020617"
+                  fontWeight="$extrabold"
+                  letterSpacing="$md"
+                  fontSize="$xs"
+                  textTransform="uppercase">
+                  {modelPanel.status === 'training'
+                    ? 'Training...'
+                    : 'Train model'}
+                </ButtonText>
+              </Button>
+            </HStack>
+          </Box>
 
           {!scanning && scanOutcome !== 'idle' ? (
             <HStack space="md" mt="$5" alignItems="stretch">

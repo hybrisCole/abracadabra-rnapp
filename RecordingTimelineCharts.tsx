@@ -50,15 +50,40 @@ type TabSlotState = {
 
 type CropMsRange = {start: number; end: number};
 
+export type CropSelection = {
+  windowId: number;
+  cropStartMs: number;
+  cropEndMs: number;
+  durationMs: number;
+  samplesTotal: number;
+  samplesInCrop: number;
+  tMsFirstInCrop: number | null;
+  tMsLastInCrop: number | null;
+  samples: ImuSample[];
+};
+
+type RecordingTimelineChartsProps = {
+  samples: ImuSample[];
+  windowId: number;
+  onCropSelected?: (selection: CropSelection) => void;
+};
+
 type CropAction =
   | {type: 'reset'; tMin: number; tMax: number}
   | {type: 'setStart'; value: number; tMin: number; tMax: number}
   | {type: 'setEnd'; value: number; tMin: number; tMax: number};
 
+function nextCropState(
+  state: CropMsRange,
+  next: CropMsRange,
+): CropMsRange {
+  return state.start === next.start && state.end === next.end ? state : next;
+}
+
 function cropReducer(state: CropMsRange, action: CropAction): CropMsRange {
   switch (action.type) {
     case 'reset':
-      return {start: action.tMin, end: action.tMax};
+      return nextCropState(state, {start: action.tMin, end: action.tMax});
     case 'setStart': {
       const {tMin: tm, tMax: tx} = action;
       const span = Math.max(tx - tm, 1);
@@ -70,7 +95,7 @@ function cropReducer(state: CropMsRange, action: CropAction): CropMsRange {
         end = Math.min(start + Math.min(5, span), tx);
         start = Math.min(start, end);
       }
-      return {start, end};
+      return nextCropState(state, {start, end});
     }
     case 'setEnd': {
       const {tMin: tm, tMax: tx} = action;
@@ -82,7 +107,7 @@ function cropReducer(state: CropMsRange, action: CropAction): CropMsRange {
         start = Math.max(end - Math.min(5, Math.max(tx - tm, 1)), tm);
         end = Math.max(end, start);
       }
-      return {start, end};
+      return nextCropState(state, {start, end});
     }
     default:
       return state;
@@ -315,10 +340,8 @@ function ChartPanel({title, subtitle, series, cropOverlay}: PanelProps): React.J
 export function RecordingTimelineCharts({
   samples,
   windowId,
-}: {
-  samples: ImuSample[];
-  windowId: number;
-}): React.JSX.Element {
+  onCropSelected,
+}: RecordingTimelineChartsProps): React.JSX.Element {
   const [crop, dispatchCrop] = useReducer(cropReducer, {
     start: 0,
     end: 1,
@@ -442,11 +465,11 @@ export function RecordingTimelineCharts({
     cropEnd: crop.end,
   };
 
-  const logCropSelection = (): void => {
+  const selectCrop = (): void => {
     const lo = Math.min(crop.start, crop.end);
     const hi = Math.max(crop.start, crop.end);
     const cropped = samples.filter(s => s.t_ms >= lo && s.t_ms <= hi);
-    const summary = {
+    const selection: CropSelection = {
       windowId,
       cropStartMs: lo,
       cropEndMs: hi,
@@ -455,11 +478,21 @@ export function RecordingTimelineCharts({
       samplesInCrop: cropped.length,
       tMsFirstInCrop: cropped[0]?.t_ms ?? null,
       tMsLastInCrop: cropped[cropped.length - 1]?.t_ms ?? null,
+      samples: cropped,
     };
-    console.log('[TimelineCrop]', JSON.stringify(summary, null, 2));
-    if (__DEV__ && cropped.length > 0) {
-      console.log('[TimelineCrop] first sample', cropped[0]);
-      console.log('[TimelineCrop] last sample', cropped[cropped.length - 1]);
+
+    onCropSelected?.(selection);
+
+    if (__DEV__) {
+      const summary = {
+        ...selection,
+        samples: `${selection.samples.length} selected samples`,
+      };
+      console.log('[TimelineCrop]', JSON.stringify(summary, null, 2));
+      if (cropped.length > 0) {
+        console.log('[TimelineCrop] first sample', cropped[0]);
+        console.log('[TimelineCrop] last sample', cropped[cropped.length - 1]);
+      }
     }
   };
 
@@ -682,9 +715,12 @@ export function RecordingTimelineCharts({
             maximumValue={tMax}
             step={1}
             value={crop.start}
-            onValueChange={v =>
-              dispatchCrop({type: 'setStart', value: v, tMin, tMax})
-            }
+            onValueChange={v => {
+              const nextStart = Math.round(Math.min(Math.max(v, tMin), tMax));
+              if (nextStart !== crop.start) {
+                dispatchCrop({type: 'setStart', value: nextStart, tMin, tMax});
+              }
+            }}
             minimumTrackTintColor="rgba(34,211,238,0.55)"
             maximumTrackTintColor="rgba(51,65,85,0.85)"
             thumbTintColor="#22d3ee"
@@ -700,9 +736,12 @@ export function RecordingTimelineCharts({
             maximumValue={tMax}
             step={1}
             value={crop.end}
-            onValueChange={v =>
-              dispatchCrop({type: 'setEnd', value: v, tMin, tMax})
-            }
+            onValueChange={v => {
+              const nextEnd = Math.round(Math.min(Math.max(v, tMin), tMax));
+              if (nextEnd !== crop.end) {
+                dispatchCrop({type: 'setEnd', value: nextEnd, tMin, tMax});
+              }
+            }}
             minimumTrackTintColor="rgba(244,114,182,0.55)"
             maximumTrackTintColor="rgba(51,65,85,0.85)"
             thumbTintColor="#f472b6"
@@ -717,14 +756,14 @@ export function RecordingTimelineCharts({
           bg="rgba(217,70,239,0.35)"
           borderWidth={1}
           borderColor="rgba(217,70,239,0.75)"
-          onPress={logCropSelection}>
+          onPress={selectCrop}>
           <ButtonText
             color="#f9a8d4"
             fontWeight="$extrabold"
             letterSpacing="$md"
             fontSize="$xs"
             textTransform="uppercase">
-            Crop · log selection
+            Select crop
           </ButtonText>
         </Button>
       </View>

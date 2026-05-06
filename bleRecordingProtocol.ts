@@ -179,11 +179,21 @@ export async function pullPackedPayloadFromPeripheral(
     if (chunk.length === 0) {
       throw new Error('Peripheral returned zero-length slice (link lost or pull not ready)');
     }
-    if (offset + chunk.length > totalBytes) {
-      throw new Error('Pull slice overflow');
+    const remaining = totalBytes - offset;
+    let bytesToCopy = chunk.length;
+    if (chunk.length > remaining) {
+      bytesToCopy = remaining;
     }
-    buf.set(chunk, offset);
-    offset += chunk.length;
+    if (__DEV__ && bytesToCopy !== chunk.length) {
+      console.warn('[BlePull] trimming final slice', {
+        offset,
+        totalBytes,
+        remaining,
+        received: chunk.length,
+      });
+    }
+    buf.set(chunk.subarray(0, bytesToCopy), offset);
+    offset += bytesToCopy;
     onProgress?.(offset, totalBytes);
   }
 
