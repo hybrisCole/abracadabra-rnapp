@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "."
+		},
+		{
+			"path": "../abracadabra_gesture_processing"
 		}
 	],
 	"settings": {}
