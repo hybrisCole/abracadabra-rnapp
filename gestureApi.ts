@@ -1,4 +1,5 @@
 import type {DecodedRecording, ImuSample} from './bleRecordingProtocol';
+import {resolveSegmentsByPrecedence} from './segmentResolve';
 
 export const GESTURE_API_BASE_URL =
   'https://abracadabragestureprocessing-production.up.railway.app';
@@ -130,7 +131,10 @@ export type AnalyzeRecordingResponse = {
   sample_rate_hz: number;
   duration_ms: number;
   counts: Partial<Record<ServerMovementType, number>>;
+  resolved_counts?: Partial<Record<ServerMovementType, number>>;
   segments: GestureSegment[];
+  resolved_segments?: GestureSegment[];
+  sequence?: PasswordMovementType[];
   raw_window_predictions: RawWindowPredictions;
   window_params: {
     window_size_ms: number;
@@ -258,6 +262,43 @@ export function segmentsToPasswordSequence(
   );
 }
 
+export function normalizeAnalyzeRecordingResponse(
+  response: AnalyzeRecordingResponse,
+): AnalyzeRecordingResponse {
+  const resolved_segments =
+    response.resolved_segments != null && response.resolved_segments.length > 0
+      ? response.resolved_segments
+      : resolveSegmentsByPrecedence(response.segments);
+  const sequence =
+    response.sequence != null
+      ? filterPasswordMovements(response.sequence)
+      : segmentsToPasswordSequence(resolved_segments);
+
+  return {
+    ...response,
+    resolved_segments,
+    sequence,
+  };
+}
+
+/** Prefer server-resolved sequence; fall back to client-side precedence resolve. */
+export function analysisToPasswordSequence(
+  analysis: Pick<
+    AnalyzeRecordingResponse,
+    'sequence' | 'resolved_segments' | 'segments'
+  >,
+): PasswordMovementType[] {
+  if (analysis.sequence != null) {
+    return filterPasswordMovements(analysis.sequence);
+  }
+  if (analysis.resolved_segments != null && analysis.resolved_segments.length > 0) {
+    return segmentsToPasswordSequence(analysis.resolved_segments);
+  }
+  return segmentsToPasswordSequence(
+    resolveSegmentsByPrecedence(analysis.segments),
+  );
+}
+
 export const gestureApi = {
   health: () => requestJson<ApiHealthResponse>('/health'),
 
@@ -284,12 +325,17 @@ export const gestureApi = {
       body: payload,
     }),
 
-  analyzeRecording: (payload: AnalyzeRecordingRequest) =>
-    requestJson<AnalyzeRecordingResponse>('/api/recordings/analyze', {
-      method: 'POST',
-      body: payload,
-      timeoutMs: 30000,
-    }),
+  analyzeRecording: async (payload: AnalyzeRecordingRequest) => {
+    const response = await requestJson<AnalyzeRecordingResponse>(
+      '/api/recordings/analyze',
+      {
+        method: 'POST',
+        body: payload,
+        timeoutMs: 30000,
+      },
+    );
+    return normalizeAnalyzeRecordingResponse(response);
+  },
 
   verifyGesturePassword: (payload: VerifyGesturePasswordRequest) =>
     requestJson<VerifyGesturePasswordResponse>('/api/gesture-passwords/verify', {

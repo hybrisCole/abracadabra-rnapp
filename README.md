@@ -8,8 +8,10 @@ What this repo is today:
 - **BLE transfer:** The wearable sends **framed NOTIFY** packets on **`ADAB0003`** (magic **`0xADAB`** LE, **`pkt`** byte, reserved byte, payload):
   - **`RECORDING_PENDING` (`pkt = 4`):** right after an **accepted** double-tap — payload **`window_id` u16 LE**, **`proto_ver` u8**, reserved — so the app can show **armed / recording** before onboard capture finishes.
   - **`META` (`pkt = 1`):** after capture — **`window_id`**, **`sample_count`**, **`total_bytes`**, **IEEE CRC-32** over the full packed buffer (see **`bleRecordingProtocol.ts`**).
-  The phone **does not** stream the IMU blob over notify; it **GATT-pulls** by writing a **32-bit little-endian offset** to **`ADAB0004`** and reading slices from **`ADAB0005`** until **`total_bytes`** match **META**, then **CRC + decode**. Partial or CRC-failed pulls are **rolled back** in UI.
-- **Link UI:** **`BleLinkStatusBadge.tsx`** shows a compact capsule (**Gluestack Badge**-style): animated orb (≤30% width) + status label (**Connecting**, **Connected**, **Linked**, **Recording**, **Processing**, **Retry**, **Disconnected**). Tap the orb for a short detail **toast** (session/RSSI/GATT copy). After the byte pull completes, the badge shows **Processing** while **`finalizeRecordingFromPull`** verifies CRC and unpacks samples before the timeline appears.
+  - **`CHUNK` (`pkt = 2`):** iOS-first fast path — **`window_id` u16 + byte `offset` u32 + `data_len` u16 + packed bytes**. Firmware caps notify values at **182 bytes** for the common iOS **ATT_MTU 185** case and paces chunks with **`kBleNotifyChunkPaceMs`**; the app writes every chunk into the exact byte range declared by **META**.
+  - **`COMMIT` (`pkt = 3`):** transfer-end marker — **`window_id`**, **`total_bytes`**, **CRC-32**, protocol version. The app only accepts the recording when every byte is present and **CRC + sample decode** pass.
+  This changes **transport only**: sample rate, raw `int16` axes, `t_ms`, and model input quality remain identical. The old **`ADAB0004`** / **`ADAB0005`** GATT pull path remains in protocol code as a compatibility/diagnostic fallback. The iPhone app path prefers notify chunks to avoid repeated write-offset + read-slice round trips, then automatically recovers with GATT pull if **COMMIT** arrives before every notify byte was received.
+- **Link UI:** **`BleLinkStatusBadge.tsx`** shows a compact capsule (**Gluestack Badge**-style): animated orb (≤30% width) + status label (**Connecting**, **Connected**, **Linked**, **Recording**, **Processing**, **Retry**, **Disconnected**). Tap the orb for a short detail **toast** (session/RSSI/GATT copy). After notify chunks complete, the badge shows **Processing** while **`finalizeRecordingPayload`** verifies CRC and unpacks samples before the timeline appears.
 - **Recording UI:** Verified recordings show a **Recording timeline** card with **[Gluestack Tabs](https://gluestack.io/ui)** switching SVG charts in **`RecordingTimelineCharts.tsx`**: **ACC RAW**, **GYRO RAW**, **ACC MAG** (‖a‖), **GYRO MAG** (‖ω‖), **ALL MAG** (‖a‖ and ‖ω‖ each min–max normalized to 0…1 for shape comparison), **ALL RAW** (six raw axes each min–max normalized the same way). A **window time** strip shows **`t_ms`** range from the samples (nominal **index × 5 ms** on the MCU—see firmware README); it is **not** BLE transfer duration. **Crop timeline** sliders use **`@react-native-community/slider`** (run **`bundle exec pod install`** under **`ios/`** after install).
 - **Gesture ML flow:** The app’s decoded recording shape is the source of truth for **`abracadabra_gesture_processing`**. A recording is **`{ windowId, samples: [{ t_ms, ax, ay, az, gx, gy, gz }] }`**. Cropped timeline windows can be labeled as **`tap`**, **`double_tap`**, **`still`** / **silence**, or **`wrist_rotation`** and uploaded as JSON training samples. The app can refresh server/model status, train the Random Forest model, classify a selected crop, analyze a full 3–4 s recording into timed segments (`movement_type`, `start_ms`, `end_ms`, `confidence`), and compare the non-`still` detected sequence against an in-memory gesture password. `t_ms` / `windowId` are metadata for ordering, timing, tracing, and UI mapping—not model features.
 - **Native integration:** Safe area uses **`react-native-safe-area-context`** (`useSafeAreaInsets`), not deprecated RN `SafeAreaView`. **Skia** is used for the **NeonBackdrop** gradient (main hero orb was replaced by the link badge).
@@ -19,16 +21,17 @@ This repo is set up for **iPhone** deployment; the React Native template still i
 
 ## Bluetooth (BLE)
 
-This app uses [**react-native-ble-plx**](https://github.com/dotintent/react-native-ble-plx) to scan, **connect**, discover GATT, **monitor** **`ADAB0003`** for framed **RECORDING_PENDING** + **META**, and **pull** payload data via **`ADAB0004`** / **`ADAB0005`**.
+This app uses [**react-native-ble-plx**](https://github.com/dotintent/react-native-ble-plx) to scan, **connect**, discover GATT, and **monitor** **`ADAB0003`** for framed **RECORDING_PENDING** + **META** + **CHUNK** + **COMMIT** packets. The primary device target is **iPhone**; the Android folder remains from the React Native template.
 
 - **iOS:** `ios/AbracadabraRnApp/Info.plist` includes `NSBluetoothAlwaysUsageDescription` and `NSBluetoothPeripheralUsageDescription`. After changing native deps: `cd ios && bundle exec pod install`.
-- **Flow:** Auto-scan for **`XA_Abracadabra`** → connect → discover → subscribe to **`ADAB0003-…`** on **`ADAB0001-…`**. On **RECORDING_PENDING**, arm UI / vibrate; on **META**, pull payload with offset writes + read pulls → **Processing** → CRC check → decode 14-byte LE samples. Failed transfers surface as rollback UI state.
+- **Flow:** Auto-scan for **`XA_Abracadabra`** → connect → discover → subscribe to **`ADAB0003-…`** on **`ADAB0001-…`**. On **RECORDING_PENDING**, arm UI / vibrate; on **META**, allocate the exact byte buffer; on **CHUNK**, fill by offset and update progress; on **COMMIT**, require complete byte coverage + CRC check + 14-byte LE decode before mounting charts. If notify chunks are incomplete, or chunk progress stalls and **COMMIT** never arrives, a watchdog triggers fallback pull of the same staged payload through **`ADAB0004`** / **`ADAB0005`** before rolling back. Failed transfers surface as rollback UI state.
 - **Reconnect:** After an unexpected disconnect, the app waits ~**1.8 s** and reconnects automatically (same peripheral id), up to **15** tries, then shows **Link Lost** until **Scan Again**.
-- **Android:** `requestMTU(247)` runs after connect when supported (fewer read round-trips for pull).
+- **Why notify chunks on iOS:** CoreBluetooth does not give this app the same explicit MTU-control workflow as Android, and the previous pull model paid one write-with-response plus one read for each slice. Notify chunks reduce application round trips while staying inside the common iOS notify payload limit (**182 bytes**), using a small firmware-side pace delay, and preserving the exact same packed recording plus full-buffer CRC guarantee. This is a throughput optimization, not a sampling-quality change.
+- **Debug logs:** During development, Metro logs **`[BleRx]`** for notify META / CHUNK / COMMIT progress, **`[BlePull]`** for fallback write-offset/read-slice progress, and **`[recording]`** for app-level transfer/finalize state. If the UI sticks on **Processing**, these tags show whether it is waiting on notify chunks, fallback GATT pull, or CRC/decode.
 
 ### Pairing with **abracadabra-platformio**
 
-Firmware exposes `kBleDeviceName` (e.g. **XA_Abracadabra**), service **`ADAB0001-0000-1000-8000-00805F9B34FB`**, **RECORDING_PENDING** + **META** on **`ADAB0003-…`**, pull control **`ADAB0004-…`**, pull data **`ADAB0005-…`** (see firmware README).
+Firmware exposes `kBleDeviceName` (e.g. **XA_Abracadabra**), service **`ADAB0001-0000-1000-8000-00805F9B34FB`**, **RECORDING_PENDING** + **META** + **CHUNK** + **COMMIT** on **`ADAB0003-…`**, plus compatibility pull control/data characteristics **`ADAB0004-…`** / **`ADAB0005-…`** (see firmware README).
 
 ### Pairing with **abracadabra_gesture_processing**
 
@@ -67,12 +70,109 @@ npx react-native run-ios --device
 
 Or pick your device and press Run in Xcode while Metro is running.
 
+To open React Native DevTools, press **`j`** in the Metro terminal.
+
 ### Metro + nvm (`env: node: No such file or directory`)
 
 Opening **`node_modules/.generated/launchPackager.command`** uses a bare shell — **`nvm` is not loaded**, so `node` is missing.
 
 - **Recommended:** from the project root, run `source ~/.nvm/nvm.sh && nvm use 26 && npm start`, or double‑click **`StartMetro.command`** in the repo root (same thing; executable wrapper).
 - **Xcode builds:** **`ios/.xcode.env.local`** sets **`NODE_BINARY`** after **`nvm use 26`** so Xcode’s shell scripts see `node`. That file is gitignored — start from **`ios/.xcode.env.local.example`** (`cp ios/.xcode.env.local.example ios/.xcode.env.local`) on a new clone.
+
+### Troubleshooting: after upgrading Node
+
+This project expects **Node 26**. If the app used to build under another Node version (for example Node 25.9) and then `nvm use 26` became the new default, do a clean dependency / native rebuild before chasing React Native errors:
+
+```sh
+cd /Users/albertocole/xerces_aurora/abracadabra-rnapp
+source ~/.nvm/nvm.sh
+nvm use 26
+rm -rf node_modules
+npm install
+cd ios
+bundle exec pod install
+cd ..
+npm start -- --reset-cache
+```
+
+Then, in another terminal:
+
+```sh
+cd /Users/albertocole/xerces_aurora/abracadabra-rnapp
+source ~/.nvm/nvm.sh
+nvm use 26
+npx react-native run-ios --device
+```
+
+If the command only prints `xcodebuild exited with error code 70`, rerun with verbose logs:
+
+```sh
+source ~/.nvm/nvm.sh
+nvm use 26
+npx react-native run-ios --device --verbose
+```
+
+### Troubleshooting: beta iOS / Developer Disk Image
+
+If the phone is on a beta or very new iOS version, Xcode must have a matching **Developer Disk Image** / device support package. Symptoms include:
+
+- `xcodebuild` reports **exit code 70**.
+- Xcode says **The developer disk image could not be mounted on this device**.
+- `xcodebuild -showdestinations` cannot find a valid destination.
+- Xcode logs mention `com.apple.dt.CoreDeviceError`, `enablePersonalizedDDI`, or `DVTDeviceOperation`.
+
+First confirm Xcode is selected and has iPhoneOS SDKs:
+
+```sh
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+xcodebuild -version
+xcodebuild -showsdks
+```
+
+Then open the workspace in Xcode:
+
+```sh
+open /Users/albertocole/xerces_aurora/abracadabra-rnapp/ios/AbracadabraRnApp.xcworkspace
+```
+
+In **Window → Devices and Simulators**, select the iPhone and wait for Xcode to finish pairing / preparing device support. If the phone is locked, mounting the DDI can fail with:
+
+```text
+kAMDMobileImageMounterDeviceLocked: The device is locked.
+```
+
+Fix that by unlocking the iPhone, keeping it on the Home Screen, tapping **Trust This Computer** if prompted, and temporarily setting **Settings → Display & Brightness → Auto-Lock → Never**. Reconnect the phone unlocked if Xcode is still stuck.
+
+If Xcode still cannot mount the DDI for a beta iOS build, install the matching Xcode / Xcode beta for that iOS version, reopen Xcode once so it installs components, then retry the device run.
+
+### Xcode cleanup commands
+
+When Xcode caches get stale, these are safe cleanup steps:
+
+```sh
+cd /Users/albertocole/xerces_aurora/abracadabra-rnapp/ios
+xcodebuild clean \
+  -workspace AbracadabraRnApp.xcworkspace \
+  -scheme AbracadabraRnApp \
+  -destination 'generic/platform=iOS'
+```
+
+If Xcode says no destination exists, use the GUI first (`Window → Devices and Simulators`) because that usually means the physical phone / DDI pairing is not ready yet.
+
+Large Xcode downloads live in these places:
+
+- Simulator runtimes: `/Library/Developer/CoreSimulator/Profiles/Runtimes`
+- Simulator device data: `~/Library/Developer/CoreSimulator/Devices`
+- Xcode build cache: `~/Library/Developer/Xcode/DerivedData`
+- Archives: `~/Library/Developer/Xcode/Archives`
+- Device disk images: `/Library/Developer/DeveloperDiskImages`
+
+Prefer **Xcode → Settings → Platforms** to remove old simulator runtimes, then use:
+
+```sh
+xcrun simctl delete unavailable
+rm -rf ~/Library/Developer/Xcode/DerivedData/*
+```
 
 # Getting Started
 

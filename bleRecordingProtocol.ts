@@ -1,8 +1,10 @@
 /**
  * Abracadabra BLE recording transfer:
  * - ADAB0003 NOTIFY framed packets: magic 0xADAB LE, pkt byte, reserved, payload.
- * - RECORDING_PENDING (pkt 4): 4 B payload — window_id u16 LE, proto_ver u8 — sent when DT is accepted (before capture).
- * - META (pkt 1): window, sample count, total bytes, CRC-32 — after capture; central pulls payload via ADAB0004/0005.
+ * - RECORDING_PENDING (pkt 4): 4 B payload — window_id u16 LE, proto_ver u8 — sent when DT is accepted.
+ * - META (pkt 1): window, sample count, total bytes, CRC-32 — after capture.
+ * - CHUNK (pkt 2): window_id u16, byte offset u32, data_len u16, then packed bytes.
+ * - COMMIT (pkt 3): window_id, total bytes, CRC-32; app accepts only after full CRC/decode.
  */
 
 import type {Device} from 'react-native-ble-plx';
@@ -39,16 +41,34 @@ export type FeedResult =
   | {kind: 'idle'}
   | {kind: 'recording_pending'; windowId: number}
   | {
-    kind: 'pull_pending';
+    kind: 'transfer_started';
     windowId: number;
     samples: number;
     totalBytes: number;
     crcExpected: number;
     recvEpoch: number;
   }
+  | {kind: 'transfer_progress'; windowId: number; filled: number; total: number}
+  | {
+    kind: 'transfer_complete';
+    windowId: number;
+    samples: number;
+    totalBytes: number;
+    crcExpected: number;
+    payload: Uint8Array;
+  }
+  | {
+    kind: 'notify_incomplete';
+    windowId: number;
+    samples: number;
+    totalBytes: number;
+    crcExpected: number;
+    receivedBytes: number;
+  }
   | {kind: 'error'; message: string};
 
 /** IEEE CRC-32 over full packed payload (same loop as firmware crc32Ieee). */
+/* eslint-disable no-bitwise -- CRC-32 is defined in terms of bitwise operations. */
 export function crc32Ieee(data: Uint8Array): number {
   let crc = 0xffffffff;
   for (let i = 0; i < data.length; i++) {
@@ -59,6 +79,7 @@ export function crc32Ieee(data: Uint8Array): number {
   }
   return (crc ^ 0xffffffff) >>> 0;
 }
+/* eslint-enable no-bitwise */
 
 function readU16Le(d: DataView, o: number): number {
   return d.getUint16(o, true);
@@ -92,19 +113,36 @@ export function parsePackedSamples(buffer: Uint8Array): ImuSample[] {
 }
 
 const PK_META = 1;
-/** Firmware sends this immediately after an accepted double-tap (before LED cue / sampling). */
+const PK_CHUNK = 2;
+const PK_COMMIT = 3;
+/** Firmware sends this immediately after an accepted double-tap, just before IMU capture. */
 const PK_RECORDING_PENDING = 4;
 const RECORDING_PENDING_PAYLOAD_LEN = 4;
 
 /** META framed payload after 4-byte header (matches firmware meta[16]). */
 const META_PAYLOAD_LEN = 16;
+const CHUNK_PAYLOAD_HEADER_LEN = 8;
+const COMMIT_PAYLOAD_LEN = 12;
 
 const MAX_PAYLOAD_BYTES = 24000;
+
+type NotifyTransferState = {
+  windowId: number;
+  samples: number;
+  totalBytes: number;
+  crcExpected: number;
+  payload: Uint8Array;
+  receivedMask: Uint8Array;
+  receivedBytes: number;
+  nextLogBytes: number;
+};
 
 const SILENT_RESET_REASONS = new Set([
   'scan again',
   'effect cleanup',
   'Disconnected',
+  'fallback pull starting',
+  'fallback complete',
 ]);
 
 function hexPrefix(u8: Uint8Array, maxBytes = 14): string {
@@ -124,6 +162,28 @@ function logBleRx(tag: string, detail?: Record<string, unknown>): void {
   if (__DEV__) {
     console.log('[BleRx]', tag, detail ?? '');
   }
+}
+
+function logBlePull(tag: string, detail?: Record<string, unknown>): void {
+  if (__DEV__) {
+    console.log('[BlePull]', tag, detail ?? '');
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms} ms`)), ms);
+    promise.then(
+      value => {
+        clearTimeout(t);
+        resolve(value);
+      },
+      error => {
+        clearTimeout(t);
+        reject(error);
+      },
+    );
+  });
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -157,18 +217,31 @@ export async function pullPackedPayloadFromPeripheral(
   const buf = new Uint8Array(totalBytes);
   let offset = 0;
   const ctrl = new Uint8Array(4);
+  const startedAt = Date.now();
+
+  logBlePull('start', {totalBytes});
 
   while (offset < totalBytes) {
     new DataView(ctrl.buffer).setUint32(0, offset, true);
-    await device.writeCharacteristicWithResponseForService(
-      ABRACADABRA_SERVICE_UUID,
-      ABRACADABRA_PULL_CTRL_UUID,
-      bytesToBase64(ctrl),
+    logBlePull('write offset', {offset});
+    await withTimeout(
+      device.writeCharacteristicWithResponseForService(
+        ABRACADABRA_SERVICE_UUID,
+        ABRACADABRA_PULL_CTRL_UUID,
+        bytesToBase64(ctrl),
+      ),
+      8000,
+      `GATT offset write at ${offset}`,
     );
 
-    const ch = await device.readCharacteristicForService(
-      ABRACADABRA_SERVICE_UUID,
-      ABRACADABRA_PULL_DATA_UUID,
+    logBlePull('read slice', {offset});
+    const ch = await withTimeout(
+      device.readCharacteristicForService(
+        ABRACADABRA_SERVICE_UUID,
+        ABRACADABRA_PULL_DATA_UUID,
+      ),
+      8000,
+      `GATT slice read at ${offset}`,
     );
 
     if (ch.value == null || ch.value === '') {
@@ -194,9 +267,16 @@ export async function pullPackedPayloadFromPeripheral(
     }
     buf.set(chunk.subarray(0, bytesToCopy), offset);
     offset += bytesToCopy;
+    logBlePull('progress', {
+      filled: offset,
+      totalBytes,
+      chunkBytes: bytesToCopy,
+      elapsedMs: Date.now() - startedAt,
+    });
     onProgress?.(offset, totalBytes);
   }
 
+  logBlePull('complete', {totalBytes, elapsedMs: Date.now() - startedAt});
   return buf;
 }
 
@@ -205,6 +285,7 @@ export async function pullPackedPayloadFromPeripheral(
  */
 export class RecordingAssembler {
   private recvEpoch = 0;
+  private notifyTransfer: NotifyTransferState | null = null;
 
   reset(reason?: string): void {
     if (__DEV__ && reason != null && reason !== '') {
@@ -212,6 +293,7 @@ export class RecordingAssembler {
         console.warn('[RecordingAssembler]', reason);
       }
     }
+    this.notifyTransfer = null;
   }
 
   feed(packet: Uint8Array): FeedResult {
@@ -242,57 +324,189 @@ export class RecordingAssembler {
       return {kind: 'recording_pending', windowId};
     }
 
-    if (pktType !== PK_META) {
-      return {kind: 'idle'};
+    if (pktType === PK_META) {
+      logBleRx('frame', {
+        pktType,
+        byteLength: packet.byteLength,
+        headHex: hexPrefix(packet.subarray(0, Math.min(24, packet.byteLength))),
+      });
+
+      if (packet.byteLength < 4 + META_PAYLOAD_LEN) {
+        return {kind: 'error', message: 'META too short'};
+      }
+      const win = readU16Le(dv, 4);
+      const samples = readU16Le(dv, 6);
+      const totalBytes = readU32Le(dv, 8);
+      const proto = packet[12];
+      const crcExpected = readU32Le(dv, 16);
+
+      if (proto !== 1) {
+        return {kind: 'error', message: `Unsupported proto ${proto}`};
+      }
+      const expectedFromSamples = samples * BLE_PACKED_SAMPLE_BYTES;
+      if (totalBytes !== expectedFromSamples) {
+        return {kind: 'error', message: 'META totalBytes mismatch'};
+      }
+      if (totalBytes === 0 || totalBytes > MAX_PAYLOAD_BYTES) {
+        return {kind: 'error', message: 'META invalid size'};
+      }
+
+      this.recvEpoch += 1;
+      this.notifyTransfer = {
+        windowId: win,
+        samples,
+        totalBytes,
+        crcExpected,
+        payload: new Uint8Array(totalBytes),
+        receivedMask: new Uint8Array(totalBytes),
+        receivedBytes: 0,
+        nextLogBytes: Math.min(1024, totalBytes),
+      };
+      logBleRx('META ok (notify chunks)', {
+        recvEpoch: this.recvEpoch,
+        windowId: win,
+        samples,
+        totalBytes,
+        crc: crcExpected.toString(16),
+      });
+
+      return {
+        kind: 'transfer_started',
+        windowId: win,
+        samples,
+        totalBytes,
+        crcExpected,
+        recvEpoch: this.recvEpoch,
+      };
     }
 
-    logBleRx('frame', {
-      pktType,
-      byteLength: packet.byteLength,
-      headHex: hexPrefix(packet.subarray(0, Math.min(24, packet.byteLength))),
-    });
+    if (pktType === PK_CHUNK) {
+      const transfer = this.notifyTransfer;
+      if (transfer == null) {
+        logBleRx('CHUNK without active transfer', {
+          byteLength: packet.byteLength,
+          headHex: hexPrefix(packet.subarray(0, Math.min(24, packet.byteLength))),
+        });
+        return {kind: 'idle'};
+      }
+      if (packet.byteLength < 4 + CHUNK_PAYLOAD_HEADER_LEN) {
+        return {kind: 'error', message: 'CHUNK too short'};
+      }
+      const win = readU16Le(dv, 4);
+      const offset = readU32Le(dv, 6);
+      const dataLen = readU16Le(dv, 10);
+      const dataStart = 4 + CHUNK_PAYLOAD_HEADER_LEN;
+      const dataEnd = dataStart + dataLen;
+      if (win !== transfer.windowId) {
+        return {kind: 'error', message: 'CHUNK window mismatch'};
+      }
+      if (dataLen === 0 || dataEnd > packet.byteLength) {
+        return {kind: 'error', message: 'CHUNK length mismatch'};
+      }
+      if (offset + dataLen > transfer.totalBytes) {
+        return {kind: 'error', message: 'CHUNK offset out of range'};
+      }
 
-    if (packet.byteLength < 4 + META_PAYLOAD_LEN) {
-      return {kind: 'error', message: 'META too short'};
+      transfer.payload.set(packet.subarray(dataStart, dataEnd), offset);
+      for (let i = 0; i < dataLen; i++) {
+        const at = offset + i;
+        if (transfer.receivedMask[at] === 0) {
+          transfer.receivedMask[at] = 1;
+          transfer.receivedBytes += 1;
+        }
+      }
+      if (
+        transfer.receivedBytes >= transfer.nextLogBytes ||
+        transfer.receivedBytes === transfer.totalBytes
+      ) {
+        logBleRx('CHUNK progress', {
+          windowId: transfer.windowId,
+          receivedBytes: transfer.receivedBytes,
+          totalBytes: transfer.totalBytes,
+          offset,
+          dataLen,
+        });
+        transfer.nextLogBytes = Math.min(
+          transfer.nextLogBytes + 1024,
+          transfer.totalBytes,
+        );
+      }
+      return {
+        kind: 'transfer_progress',
+        windowId: transfer.windowId,
+        filled: transfer.receivedBytes,
+        total: transfer.totalBytes,
+      };
     }
-    const win = readU16Le(dv, 4);
-    const samples = readU16Le(dv, 6);
-    const totalBytes = readU32Le(dv, 8);
-    const proto = packet[12];
-    const crcExpected = readU32Le(dv, 16);
 
-    if (proto !== 1) {
-      return {kind: 'error', message: `Unsupported proto ${proto}`};
-    }
-    const expectedFromSamples = samples * BLE_PACKED_SAMPLE_BYTES;
-    if (totalBytes !== expectedFromSamples) {
-      return {kind: 'error', message: 'META totalBytes mismatch'};
-    }
-    if (totalBytes === 0 || totalBytes > MAX_PAYLOAD_BYTES) {
-      return {kind: 'error', message: 'META invalid size'};
+    if (pktType === PK_COMMIT) {
+      const transfer = this.notifyTransfer;
+      if (transfer == null) {
+        logBleRx('COMMIT without active transfer', {
+          byteLength: packet.byteLength,
+          headHex: hexPrefix(packet.subarray(0, Math.min(24, packet.byteLength))),
+        });
+        return {kind: 'idle'};
+      }
+      if (packet.byteLength < 4 + COMMIT_PAYLOAD_LEN) {
+        return {kind: 'error', message: 'COMMIT too short'};
+      }
+      const win = readU16Le(dv, 4);
+      const totalBytes = readU32Le(dv, 6);
+      const crcExpected = readU32Le(dv, 10);
+      const proto = packet[14];
+      if (proto !== 1) {
+        return {kind: 'error', message: `COMMIT unsupported proto ${proto}`};
+      }
+      if (
+        win !== transfer.windowId ||
+        totalBytes !== transfer.totalBytes ||
+        crcExpected !== transfer.crcExpected
+      ) {
+        return {kind: 'error', message: 'COMMIT metadata mismatch'};
+      }
+      if (transfer.receivedBytes !== transfer.totalBytes) {
+        logBleRx('COMMIT incomplete', {
+          windowId: transfer.windowId,
+          receivedBytes: transfer.receivedBytes,
+          totalBytes: transfer.totalBytes,
+        });
+        const incomplete = {
+          kind: 'notify_incomplete' as const,
+          windowId: transfer.windowId,
+          samples: transfer.samples,
+          totalBytes: transfer.totalBytes,
+          crcExpected: transfer.crcExpected,
+          receivedBytes: transfer.receivedBytes,
+        };
+        this.notifyTransfer = null;
+        return {
+          ...incomplete,
+        };
+      }
+
+      const payload = transfer.payload;
+      this.notifyTransfer = null;
+      logBleRx('COMMIT ok (notify chunks)', {
+        windowId: win,
+        totalBytes,
+        crc: crcExpected.toString(16),
+      });
+      return {
+        kind: 'transfer_complete',
+        windowId: win,
+        samples: transfer.samples,
+        totalBytes,
+        crcExpected,
+        payload,
+      };
     }
 
-    this.recvEpoch += 1;
-    logBleRx('META ok (pull)', {
-      recvEpoch: this.recvEpoch,
-      windowId: win,
-      samples,
-      totalBytes,
-      crc: crcExpected.toString(16),
-    });
-
-    return {
-      kind: 'pull_pending',
-      windowId: win,
-      samples,
-      totalBytes,
-      crcExpected,
-      recvEpoch: this.recvEpoch,
-    };
+    return {kind: 'idle'};
   }
 }
 
-export async function finalizeRecordingFromPull(
+export async function finalizeRecordingPayload(
   windowId: number,
   samples: number,
   crcExpected: number,

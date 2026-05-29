@@ -8,7 +8,6 @@ import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   Animated,
   Easing,
-  Platform,
   StatusBar,
   StyleSheet,
   Vibration,
@@ -35,7 +34,7 @@ import {config} from '@gluestack-ui/config';
 import {
   ABRACADABRA_SERVICE_UUID,
   ABRACADABRA_STREAM_CHAR_UUID,
-  finalizeRecordingFromPull,
+  finalizeRecordingPayload,
   pullPackedPayloadFromPeripheral,
   RecordingAssembler,
   type DecodedRecording,
@@ -49,7 +48,7 @@ import {
   type ModelStatusResponse,
   type PasswordMovementType,
   type SaveTrainingSampleResponse,
-  segmentsToPasswordSequence,
+  analysisToPasswordSequence,
   type TrainingSamplesResponse,
 } from './gestureApi';
 import {NeonBackdrop} from './NeonBackdrop';
@@ -60,6 +59,7 @@ import {
 
 const TARGET_BLE_NAME = 'XA_Abracadabra';
 const SCAN_DURATION_MS = 5000;
+const NOTIFY_STREAM_STALL_MS = 4500;
 
 /** Decorative hero title (combining marks); VoiceOver uses accessibilityLabel below. */
 const GLITCH_HERO_TITLE =
@@ -111,6 +111,15 @@ type RecordingAnalysisState =
   | {status: 'analyzing'}
   | {status: 'analyzed'; response: AnalyzeRecordingResponse}
   | {status: 'error'; message: string};
+
+type NotifyFallbackMeta = {
+  windowId: number;
+  samples: number;
+  totalBytes: number;
+  crcExpected: number;
+  receivedBytes: number;
+  reason: string;
+};
 
 const TRAINING_LABELS: {value: MovementType; label: string; helper: string}[] = [
   {value: 'tap', label: 'Tap', helper: 'single hit'},
@@ -194,7 +203,11 @@ function AbracadabraScreen(): React.JSX.Element {
   const feedbackOutcomeRef = useRef<ScanOutcome>('idle');
 
   const assemblerRef = useRef(new RecordingAssembler());
-  const pullInFlightRef = useRef(false);
+  const transferInFlightRef = useRef(false);
+  const notifyStreamWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const notifyFallbackMetaRef = useRef<NotifyFallbackMeta | null>(null);
   const bleMonitorSubRef = useRef<Subscription | null>(null);
   const connectedDevRef = useRef<Device | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -212,7 +225,7 @@ function AbracadabraScreen(): React.JSX.Element {
   const [wearableCaptureArming, setWearableCaptureArming] = useState<{
     windowId: number;
   } | null>(null);
-  /** After GATT pull completes — CRC verify + unpack samples before timeline mounts. */
+  /** After notify chunks complete — CRC verify + unpack samples before timeline mounts. */
   const [processingCapture, setProcessingCapture] = useState(false);
   const [transferNote, setTransferNote] = useState<string | null>(null);
   const [lastRecording, setLastRecording] = useState<DecodedRecording | null>(
@@ -252,6 +265,119 @@ function AbracadabraScreen(): React.JSX.Element {
   const prevConnPhaseForBadgeRef = useRef<ConnPhase>('off');
 
   const insets = useSafeAreaInsets();
+
+  const clearNotifyStreamWatchdog = useCallback(() => {
+    if (notifyStreamWatchdogRef.current != null) {
+      clearTimeout(notifyStreamWatchdogRef.current);
+      notifyStreamWatchdogRef.current = null;
+    }
+  }, []);
+
+  const recoverWithFallbackPull = useCallback(
+    (meta: NotifyFallbackMeta) => {
+      clearNotifyStreamWatchdog();
+      notifyFallbackMetaRef.current = null;
+      assemblerRef.current.reset('fallback pull starting');
+      const linkedDev = connectedDevRef.current;
+      if (!linkedDev) {
+        setRecvProgress(null);
+        setProcessingCapture(false);
+        setTransferNote(
+          `Notify stream ${meta.reason} ${meta.receivedBytes}/${meta.totalBytes}; not connected for fallback pull`,
+        );
+        transferInFlightRef.current = false;
+        assemblerRef.current.reset(`notify ${meta.reason} and disconnected`);
+        return;
+      }
+
+      console.log('[recording] fallback GATT pull starting', meta);
+      setProcessingCapture(false);
+      setTransferNote(null);
+      setRecvProgress({filled: meta.receivedBytes, total: meta.totalBytes});
+
+      pullPackedPayloadFromPeripheral(
+        linkedDev,
+        meta.totalBytes,
+        (filled, total) => setRecvProgress({filled, total}),
+      )
+        .then(payload => {
+          console.log('[recording] fallback GATT pull complete; finalizing', {
+            windowId: meta.windowId,
+            bytes: payload.byteLength,
+          });
+          setRecvProgress(null);
+          setProcessingCapture(true);
+          return finalizeRecordingPayload(
+            meta.windowId,
+            meta.samples,
+            meta.crcExpected,
+            payload,
+          );
+        })
+        .then(fin => {
+          setProcessingCapture(false);
+          if ('error' in fin) {
+            console.warn('[recording] fallback finalize failed', fin);
+            setTransferNote(fin.error);
+            setRecvProgress(null);
+            setWearableCaptureArming(null);
+            setConnPhase('linked');
+            assemblerRef.current.reset('fallback finalize failed');
+            transferInFlightRef.current = false;
+          } else {
+            console.log('[recording] fallback finalize complete', {
+              windowId: fin.windowId,
+              samples: fin.samples.length,
+            });
+            setSelectedCrop(null);
+            setTrainingUpload({status: 'idle'});
+            setCropClassification({status: 'idle'});
+            setRecordingAnalysis({status: 'idle'});
+            setLastRecording(fin);
+            setTransferNote(null);
+            transferInFlightRef.current = false;
+            assemblerRef.current.reset('fallback complete');
+            Vibration.vibrate([0, 30, 50, 90, 40, 120]);
+          }
+        })
+        .catch(e => {
+          setRecvProgress(null);
+          setProcessingCapture(false);
+          setWearableCaptureArming(null);
+          setConnPhase('linked');
+          assemblerRef.current.reset('fallback pull failed');
+          const msg = e instanceof Error ? e.message : String(e);
+          setTransferNote(msg);
+          if (__DEV__) {
+            console.warn('[BLE fallback pull]', formatErrorDetail(e), e);
+          }
+        })
+        .finally(() => {
+          console.log('[recording] fallback transfer settled');
+          transferInFlightRef.current = false;
+        });
+    },
+    [clearNotifyStreamWatchdog],
+  );
+
+  const armNotifyStreamWatchdog = useCallback(
+    (meta: NotifyFallbackMeta) => {
+      clearNotifyStreamWatchdog();
+      notifyFallbackMetaRef.current = meta;
+      notifyStreamWatchdogRef.current = setTimeout(() => {
+        const latest = notifyFallbackMetaRef.current;
+        if (latest == null) {
+          return;
+        }
+        console.warn('[recording] notify stream watchdog fired', latest);
+        recoverWithFallbackPull({
+          ...latest,
+          reason: 'stalled',
+        });
+      }, NOTIFY_STREAM_STALL_MS);
+    },
+    [clearNotifyStreamWatchdog, recoverWithFallbackPull],
+  );
 
   useEffect(() => {
     const mgr = new BleManager();
@@ -334,6 +460,9 @@ function AbracadabraScreen(): React.JSX.Element {
     setProcessingCapture(false);
     setTransferNote(null);
     setLastRecording(null);
+    clearNotifyStreamWatchdog();
+    notifyFallbackMetaRef.current = null;
+    transferInFlightRef.current = false;
     assemblerRef.current.reset('scan again');
     autoReconnectRoundRef.current = 0;
     setReconnectAttempt(0);
@@ -399,7 +528,7 @@ function AbracadabraScreen(): React.JSX.Element {
       setScanning(false);
       setHasScanned(true);
     }, SCAN_DURATION_MS);
-  }, [scanning]);
+  }, [clearNotifyStreamWatchdog, scanning]);
 
   useEffect(() => {
     if (!targetDevice || bleState !== State.PoweredOn) {
@@ -451,18 +580,12 @@ function AbracadabraScreen(): React.JSX.Element {
 
         connectedDevRef.current = dev;
 
-        if (Platform.OS === 'android') {
-          try {
-            await dev.requestMTU(247);
-          } catch {
-            /* MTU optional */
-          }
-        }
-
         await dev.discoverAllServicesAndCharacteristics();
 
         disconnectSub = dev.onDisconnected(() => {
-          pullInFlightRef.current = false;
+          clearNotifyStreamWatchdog();
+          notifyFallbackMetaRef.current = null;
+          transferInFlightRef.current = false;
           assemblerRef.current.reset('Disconnected');
           connectedDevRef.current = null;
           bleMonitorSubRef.current?.remove();
@@ -514,61 +637,80 @@ function AbracadabraScreen(): React.JSX.Element {
               Vibration.vibrate([0, 45]);
               return;
             }
-            if (result.kind === 'pull_pending') {
-              if (pullInFlightRef.current) {
+            if (result.kind === 'transfer_started') {
+              if (transferInFlightRef.current) {
                 return;
               }
-              const linkedDev = connectedDevRef.current;
-              if (!linkedDev) {
-                setTransferNote('Not connected');
-                return;
-              }
-              pullInFlightRef.current = true;
+              transferInFlightRef.current = true;
               setWearableCaptureArming(null);
               setRecvProgress({filled: 0, total: result.totalBytes});
-              console.log('[recording] started receiving payload', {
+              console.log('[recording] notify stream started', {
                 windowId: result.windowId,
                 samples: result.samples,
                 totalBytes: result.totalBytes,
               });
-              pullPackedPayloadFromPeripheral(
-                linkedDev,
-                result.totalBytes,
-                (filled, total) => setRecvProgress({filled, total}),
-              )
-                .then(
-                  payload =>
-                    new Promise<
-                      DecodedRecording | {error: string}
-                    >((resolve, reject) => {
-                      setRecvProgress(null);
-                      setProcessingCapture(true);
-                      /** Next macrotask so React can paint Processing before sync finalize runs. */
-                      setTimeout(() => {
-                        finalizeRecordingFromPull(
-                          result.windowId,
-                          result.samples,
-                          result.crcExpected,
-                          payload,
-                        ).then(resolve, reject);
-                      }, 0);
-                    }),
+              armNotifyStreamWatchdog({
+                windowId: result.windowId,
+                samples: result.samples,
+                totalBytes: result.totalBytes,
+                crcExpected: result.crcExpected,
+                receivedBytes: 0,
+                reason: 'incomplete',
+              });
+              return;
+            }
+            if (result.kind === 'transfer_progress') {
+              setRecvProgress({filled: result.filled, total: result.total});
+              const prior = notifyFallbackMetaRef.current;
+              if (prior != null && prior.windowId === result.windowId) {
+                armNotifyStreamWatchdog({
+                  ...prior,
+                  receivedBytes: result.filled,
+                  reason: 'incomplete',
+                });
+              }
+              return;
+            }
+            if (result.kind === 'transfer_complete') {
+              clearNotifyStreamWatchdog();
+              notifyFallbackMetaRef.current = null;
+              console.log('[recording] notify stream complete; finalizing', {
+                windowId: result.windowId,
+                samples: result.samples,
+                totalBytes: result.totalBytes,
+              });
+              setRecvProgress(null);
+              setProcessingCapture(true);
+              /** Next macrotask so React can paint Processing before sync finalize runs. */
+              setTimeout(() => {
+                finalizeRecordingPayload(
+                  result.windowId,
+                  result.samples,
+                  result.crcExpected,
+                  result.payload,
                 )
                 .then(fin => {
                   setProcessingCapture(false);
                   if ('error' in fin) {
+                    console.warn('[recording] notify finalize failed', fin);
                     setTransferNote(fin.error);
                     setRecvProgress(null);
                     setWearableCaptureArming(null);
                     setConnPhase('linked');
                     assemblerRef.current.reset('finalize failed');
+                    transferInFlightRef.current = false;
                   } else {
+                    console.log('[recording] notify finalize complete', {
+                      windowId: fin.windowId,
+                      samples: fin.samples.length,
+                    });
                     setSelectedCrop(null);
                     setTrainingUpload({status: 'idle'});
                     setCropClassification({status: 'idle'});
                     setRecordingAnalysis({status: 'idle'});
                     setLastRecording(fin);
                     setTransferNote(null);
+                    transferInFlightRef.current = false;
                     Vibration.vibrate([0, 30, 50, 90, 40, 120]);
                   }
                 })
@@ -577,19 +719,41 @@ function AbracadabraScreen(): React.JSX.Element {
                   setProcessingCapture(false);
                   setWearableCaptureArming(null);
                   setConnPhase('linked');
-                  assemblerRef.current.reset('pull failed');
+                  assemblerRef.current.reset('notify stream failed');
                   const msg = e instanceof Error ? e.message : String(e);
                   setTransferNote(msg);
                   if (__DEV__) {
-                    console.warn('[BLE pull]', formatErrorDetail(e), e);
+                    console.warn('[BLE notify stream]', formatErrorDetail(e), e);
                   }
                 })
                 .finally(() => {
-                  pullInFlightRef.current = false;
+                  console.log('[recording] notify finalize settled');
+                  clearNotifyStreamWatchdog();
+                  notifyFallbackMetaRef.current = null;
+                  transferInFlightRef.current = false;
                 });
+              }, 0);
+            } else if (result.kind === 'notify_incomplete') {
+              console.warn('[recording] notify incomplete; evaluating fallback', {
+                windowId: result.windowId,
+                receivedBytes: result.receivedBytes,
+                totalBytes: result.totalBytes,
+              });
+              recoverWithFallbackPull({
+                windowId: result.windowId,
+                samples: result.samples,
+                totalBytes: result.totalBytes,
+                crcExpected: result.crcExpected,
+                receivedBytes: result.receivedBytes,
+                reason: 'incomplete',
+              });
             } else if (result.kind === 'error') {
+              clearNotifyStreamWatchdog();
+              notifyFallbackMetaRef.current = null;
+              console.warn('[recording] transfer protocol error', result);
               setRecvProgress(null);
               setTransferNote(result.message);
+              transferInFlightRef.current = false;
               assemblerRef.current.reset();
             }
           },
@@ -614,6 +778,8 @@ function AbracadabraScreen(): React.JSX.Element {
 
     return () => {
       cancelled = true;
+      clearNotifyStreamWatchdog();
+      notifyFallbackMetaRef.current = null;
       if (reconnectTimerRef.current != null) {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -634,6 +800,7 @@ function AbracadabraScreen(): React.JSX.Element {
       setRecvProgress(null);
       setWearableCaptureArming(null);
       setProcessingCapture(false);
+      transferInFlightRef.current = false;
       setConnPhase('off');
     };
     // Re-run session only when peripheral id / radio / link generation changes (not DeviceRow churn).
@@ -747,7 +914,7 @@ function AbracadabraScreen(): React.JSX.Element {
     } else if (wearableCaptureArming != null && connPhase === 'linked') {
       description = `Gesture accepted — RSSI ${formatRssi(targetDevice.rssi)}. The wearable waits briefly before sampling so tap motion does not dominate the trace. Stay steady until transfer begins.`;
     } else if (connPhase === 'linked') {
-      description = `Paired — RSSI ${formatRssi(targetDevice.rssi)}. Perform the accepted double-tap gesture; when capture completes, the phone pulls the recording over GATT (META notify + read slices).`;
+      description = `Paired — RSSI ${formatRssi(targetDevice.rssi)}. Perform the accepted double-tap gesture; when capture completes, the phone receives notify chunks, validates CRC, and decodes the recording.`;
     } else if (connPhase === 'connecting') {
       description =
         reconnectAttempt > 0
@@ -929,7 +1096,7 @@ function AbracadabraScreen(): React.JSX.Element {
   const detectedPasswordSequence = useMemo(
     () =>
       recordingAnalysis.status === 'analyzed'
-        ? segmentsToPasswordSequence(recordingAnalysis.response.segments)
+        ? analysisToPasswordSequence(recordingAnalysis.response)
         : [],
     [recordingAnalysis],
   );
@@ -1336,7 +1503,12 @@ function AbracadabraScreen(): React.JSX.Element {
                     <Text mt="$1" color="#94a3b8" fontFamily="Menlo" fontSize="$xs">
                       {recordingAnalysis.response.duration_ms} ms ·{' '}
                       {recordingAnalysis.response.sample_rate_hz.toFixed(1)} Hz ·{' '}
-                      {recordingAnalysis.response.segments.length} segments
+                      {(
+                        recordingAnalysis.response.resolved_segments ??
+                        recordingAnalysis.response.segments
+                      ).length}{' '}
+                      resolved segments ·{' '}
+                      {recordingAnalysis.response.segments.length} raw
                     </Text>
                     <Box
                       mt="$3"
@@ -1422,7 +1594,10 @@ function AbracadabraScreen(): React.JSX.Element {
                       </HStack>
                     </Box>
                     <Box mt="$3" gap="$2">
-                      {recordingAnalysis.response.segments.map(segment => (
+                      {(
+                        recordingAnalysis.response.resolved_segments ??
+                        recordingAnalysis.response.segments
+                      ).map(segment => (
                         <HStack
                           key={`${segment.movement_type}-${segment.start_ms}-${segment.end_ms}`}
                           justifyContent="space-between"
