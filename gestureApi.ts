@@ -1,5 +1,12 @@
 import type {DecodedRecording, ImuSample} from './bleRecordingProtocol';
-import {resolveSegmentsByPrecedence} from './segmentResolve';
+import {
+  MIN_GESTURE_CONFIDENCE,
+  filterSegmentsByConfidence,
+  resolveSegmentsByPrecedence,
+  segmentMeetsConfidence,
+} from './segmentResolve';
+
+export {MIN_GESTURE_CONFIDENCE};
 
 export const GESTURE_API_BASE_URL =
   'https://abracadabragestureprocessing-production.up.railway.app';
@@ -256,23 +263,24 @@ export function filterPasswordMovements(
 
 export function segmentsToPasswordSequence(
   segments: GestureSegment[],
+  minConfidence: number = MIN_GESTURE_CONFIDENCE,
 ): PasswordMovementType[] {
   return filterPasswordMovements(
-    segments.map(segment => segment.movement_type),
+    segments
+      .filter(segment => segmentMeetsConfidence(segment, minConfidence))
+      .map(segment => segment.movement_type),
   );
 }
 
 export function normalizeAnalyzeRecordingResponse(
   response: AnalyzeRecordingResponse,
 ): AnalyzeRecordingResponse {
-  const resolved_segments =
+  const resolved_segments = filterSegmentsByConfidence(
     response.resolved_segments != null && response.resolved_segments.length > 0
       ? response.resolved_segments
-      : resolveSegmentsByPrecedence(response.segments);
-  const sequence =
-    response.sequence != null
-      ? filterPasswordMovements(response.sequence)
-      : segmentsToPasswordSequence(resolved_segments);
+      : resolveSegmentsByPrecedence(response.segments),
+  );
+  const sequence = segmentsToPasswordSequence(resolved_segments);
 
   return {
     ...response,

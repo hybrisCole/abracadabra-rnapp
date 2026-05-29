@@ -1,5 +1,8 @@
 import type {GestureSegment, ServerMovementType} from './gestureApi';
 
+/** Gestures below this confidence are excluded from resolve + password sequence. */
+export const MIN_GESTURE_CONFIDENCE = 0.5;
+
 const PRECEDENCE: Record<ServerMovementType, number> = {
   wrist_rotation: 4,
   double_tap: 3,
@@ -10,6 +13,22 @@ const PRECEDENCE: Record<ServerMovementType, number> = {
 
 function rank(movement: ServerMovementType): number {
   return PRECEDENCE[movement] ?? 0;
+}
+
+export function segmentMeetsConfidence(
+  segment: GestureSegment,
+  minConfidence: number = MIN_GESTURE_CONFIDENCE,
+): boolean {
+  return segment.confidence >= minConfidence;
+}
+
+export function filterSegmentsByConfidence(
+  segments: GestureSegment[],
+  minConfidence: number = MIN_GESTURE_CONFIDENCE,
+): GestureSegment[] {
+  return segments.filter(segment =>
+    segmentMeetsConfidence(segment, minConfidence),
+  );
 }
 
 function activeSegments(
@@ -68,13 +87,15 @@ function mergeLeadingTapIntoDoubleTap(
 /** Same rules as server: precedence timeline + leading tap → double_tap merge. */
 export function resolveSegmentsByPrecedence(
   segments: GestureSegment[],
+  minConfidence: number = MIN_GESTURE_CONFIDENCE,
 ): GestureSegment[] {
-  if (segments.length === 0) {
+  const eligible = filterSegmentsByConfidence(segments, minConfidence);
+  if (eligible.length === 0) {
     return [];
   }
 
   const boundaries = [
-    ...new Set(segments.flatMap(s => [s.start_ms, s.end_ms])),
+    ...new Set(eligible.flatMap(s => [s.start_ms, s.end_ms])),
   ].sort((a, b) => a - b);
 
   const slices: GestureSegment[] = [];
@@ -84,7 +105,7 @@ export function resolveSegmentsByPrecedence(
     if (endMs <= startMs) {
       continue;
     }
-    const active = activeSegments(segments, startMs, endMs);
+    const active = activeSegments(eligible, startMs, endMs);
     if (active.length === 0) {
       continue;
     }
@@ -111,5 +132,8 @@ export function resolveSegmentsByPrecedence(
     }
   }
 
-  return mergeLeadingTapIntoDoubleTap(merged);
+  return filterSegmentsByConfidence(
+    mergeLeadingTapIntoDoubleTap(merged),
+    minConfidence,
+  );
 }

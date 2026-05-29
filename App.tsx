@@ -1074,6 +1074,7 @@ function AbracadabraScreen(): React.JSX.Element {
         window_id: lastRecording.windowId,
         samples: lastRecording.samples,
         include_still: true,
+        min_confidence: 0.5,
       });
       if (__DEV__) {
         console.log('[RecordingAnalysis] analyzed', response);
