@@ -19,8 +19,6 @@ import {
   Alert,
   AlertText,
   Box,
-  Button,
-  ButtonText,
   Divider,
   GluestackUIProvider,
   Heading,
@@ -45,6 +43,7 @@ import {
   gestureApi,
   type ClassifyRecordingResponse,
   type MovementType,
+  type ServerMovementType,
   type ModelStatusResponse,
   type PasswordMovementType,
   type SaveTrainingSampleResponse,
@@ -67,6 +66,7 @@ import type {SessionFacts} from './src/store/selectors';
 import {NeonTabBar} from './src/navigation/NeonTabBar';
 import {VaultScreen} from './src/screens/VaultScreen';
 import {SpellbookScreen} from './src/screens/SpellbookScreen';
+import {NeonButton, ButtonText} from './src/ui';
 
 const TARGET_BLE_NAME = 'XA_Abracadabra';
 const SCAN_DURATION_MS = 5000;
@@ -75,6 +75,8 @@ const RECV_PROGRESS_UI_MS = 200;
 
 type RecvProgress = {filled: number; total: number};
 const NOTIFY_STREAM_STALL_MS = 4500;
+/** Min interval between clearTimeout+setTimeout on NOTIFY chunk progress (stall watchdog). */
+const NOTIFY_WATCHDOG_RESCHEDULE_MS = 500;
 
 /** Decorative hero title (combining marks); VoiceOver uses accessibilityLabel below. */
 const GLITCH_HERO_TITLE =
@@ -118,8 +120,16 @@ type ModelPanelState =
 type CropClassificationState =
   | {status: 'idle'}
   | {status: 'classifying'}
-  | {status: 'classified'; response: ClassifyRecordingResponse}
+  | {
+      status: 'classified';
+      response: ClassifyRecordingResponse;
+      /** Set when prediction disagreed with the label and confidence was high enough to switch. */
+      labelAutoUpdated?: MovementType;
+    }
   | {status: 'error'; message: string};
+
+/** Auto-apply predicted training label when it disagrees and confidence exceeds this. */
+const AUTO_LABEL_CONFIDENCE = 0.6;
 
 type RecordingAnalysisState =
   | {status: 'idle'}
@@ -142,6 +152,14 @@ const TRAINING_LABELS: {value: MovementType; label: string; helper: string}[] = 
   {value: 'wrist_rotation', label: 'Wrist rotate', helper: 'twist'},
   {value: 'still', label: 'Still', helper: 'background'},
 ];
+
+function predictionToTrainingLabel(
+  predicted: ServerMovementType,
+): MovementType | null {
+  const mapped: MovementType =
+    predicted === 'silence' ? 'still' : (predicted as MovementType);
+  return TRAINING_LABELS.some(label => label.value === mapped) ? mapped : null;
+}
 
 function formatGestureSequence(sequence: PasswordMovementType[]): string {
   return sequence.length > 0 ? sequence.join(' → ') : 'no gesture';
@@ -224,6 +242,8 @@ function AbracadabraScreen(): React.JSX.Element {
     null,
   );
   const notifyFallbackMetaRef = useRef<NotifyFallbackMeta | null>(null);
+  const lastNotifyChunkAtRef = useRef(0);
+  const lastWatchdogRescheduleRef = useRef(0);
   const bleMonitorSubRef = useRef<Subscription | null>(null);
   const connectedDevRef = useRef<Device | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -417,12 +437,27 @@ function AbracadabraScreen(): React.JSX.Element {
   );
 
   const armNotifyStreamWatchdog = useCallback(
-    (meta: NotifyFallbackMeta) => {
-      clearNotifyStreamWatchdog();
+    (meta: NotifyFallbackMeta, options?: {force?: boolean}) => {
       notifyFallbackMetaRef.current = meta;
+      lastNotifyChunkAtRef.current = Date.now();
+      const now = Date.now();
+      if (
+        !options?.force &&
+        notifyStreamWatchdogRef.current != null &&
+        now - lastWatchdogRescheduleRef.current < NOTIFY_WATCHDOG_RESCHEDULE_MS
+      ) {
+        return;
+      }
+      lastWatchdogRescheduleRef.current = now;
+      clearNotifyStreamWatchdog();
       notifyStreamWatchdogRef.current = setTimeout(() => {
         const latest = notifyFallbackMetaRef.current;
         if (latest == null) {
+          return;
+        }
+        const idleMs = Date.now() - lastNotifyChunkAtRef.current;
+        if (idleMs < NOTIFY_STREAM_STALL_MS) {
+          armNotifyStreamWatchdog(latest, {force: true});
           return;
         }
         console.warn('[recording] notify stream watchdog fired', latest);
@@ -705,14 +740,17 @@ function AbracadabraScreen(): React.JSX.Element {
                 samples: result.samples,
                 totalBytes: result.totalBytes,
               });
-              armNotifyStreamWatchdog({
-                windowId: result.windowId,
-                samples: result.samples,
-                totalBytes: result.totalBytes,
-                crcExpected: result.crcExpected,
-                receivedBytes: 0,
-                reason: 'incomplete',
-              });
+              armNotifyStreamWatchdog(
+                {
+                  windowId: result.windowId,
+                  samples: result.samples,
+                  totalBytes: result.totalBytes,
+                  crcExpected: result.crcExpected,
+                  receivedBytes: 0,
+                  reason: 'incomplete',
+                },
+                {force: true},
+              );
               return;
             }
             if (result.kind === 'transfer_progress') {
@@ -1100,7 +1138,30 @@ function AbracadabraScreen(): React.JSX.Element {
       if (__DEV__) {
         console.log('[CropClassification] classified', response);
       }
-      setCropClassification({status: 'classified', response});
+      const predictedLabel = predictionToTrainingLabel(
+        response.predicted_movement,
+      );
+      let labelAutoUpdated: MovementType | undefined;
+      if (
+        predictedLabel != null &&
+        predictedLabel !== selectedMovement &&
+        response.confidence > AUTO_LABEL_CONFIDENCE
+      ) {
+        setSelectedMovement(predictedLabel);
+        labelAutoUpdated = predictedLabel;
+        if (__DEV__) {
+          console.log(
+            '[CropClassification] training label auto-updated',
+            predictedLabel,
+            response.confidence,
+          );
+        }
+      }
+      setCropClassification({
+        status: 'classified',
+        response,
+        labelAutoUpdated,
+      });
     } catch (error) {
       const message =
         error instanceof Error ? error.message : 'Crop classification failed';
@@ -1113,7 +1174,7 @@ function AbracadabraScreen(): React.JSX.Element {
       }
       setCropClassification({status: 'error', message});
     }
-  }, [selectedCrop]);
+  }, [selectedCrop, selectedMovement]);
 
   const analyzeLastRecording = useCallback(async (): Promise<void> => {
     if (lastRecording == null || lastRecording.samples.length < 10) {
@@ -1301,14 +1362,21 @@ function AbracadabraScreen(): React.JSX.Element {
                 textTransform="uppercase">
                 Recording timeline
               </Heading>
-              <Box mt="$3">
-                <RecordingTimelineCharts
-                  samples={lastRecording.samples}
-                  windowId={lastRecording.windowId}
-                  onCropSelected={handleCropSelected}
-                />
-              </Box>
-              {selectedCrop != null ? (
+              {isFocused ? (
+                <Box mt="$3">
+                  <RecordingTimelineCharts
+                    samples={lastRecording.samples}
+                    windowId={lastRecording.windowId}
+                    onCropSelected={handleCropSelected}
+                  />
+                </Box>
+              ) : (
+                <Text mt="$3" color="#94a3b8" fontFamily="Menlo" fontSize="$sm">
+                  Window {lastRecording.windowId} · {lastRecording.samples.length}{' '}
+                  samples captured — open Training for timeline & labeling
+                </Text>
+              )}
+              {isFocused && selectedCrop != null ? (
                 <Box
                   mt="$4"
                   p="$3"
@@ -1351,7 +1419,7 @@ function AbracadabraScreen(): React.JSX.Element {
                       const active = selectedMovement === label.value;
                       const isStill = label.value === 'still';
                       return (
-                        <Button
+                        <NeonButton
                           key={label.value}
                           size="sm"
                           variant="outline"
@@ -1388,7 +1456,7 @@ function AbracadabraScreen(): React.JSX.Element {
                             textTransform="uppercase">
                             {label.label}
                           </ButtonText>
-                        </Button>
+                        </NeonButton>
                       );
                     })}
                   </Box>
@@ -1399,7 +1467,7 @@ function AbracadabraScreen(): React.JSX.Element {
                     · still is training background, not a password gesture
                   </Text>
                   <HStack mt="$4" space="sm" alignItems="center">
-                    <Button
+                    <NeonButton
                       flex={1}
                       size="sm"
                       borderRadius="$xl"
@@ -1425,8 +1493,8 @@ function AbracadabraScreen(): React.JSX.Element {
                           ? 'Uploading...'
                           : 'Upload crop'}
                       </ButtonText>
-                    </Button>
-                    <Button
+                    </NeonButton>
+                    <NeonButton
                       flex={1}
                       size="sm"
                       variant="outline"
@@ -1456,7 +1524,7 @@ function AbracadabraScreen(): React.JSX.Element {
                           ? 'Classifying...'
                           : 'Classify crop'}
                       </ButtonText>
-                    </Button>
+                    </NeonButton>
                   </HStack>
                   {trainingUpload.status === 'saved' ? (
                     <Text
@@ -1503,6 +1571,21 @@ function AbracadabraScreen(): React.JSX.Element {
                         {Math.round(cropClassification.response.confidence * 100)}
                         %
                       </Text>
+                      {cropClassification.labelAutoUpdated != null ? (
+                        <Text
+                          mt="$2"
+                          color="#a7f3d0"
+                          fontFamily="Menlo"
+                          fontSize="$xs">
+                          Training label set to{' '}
+                          {TRAINING_LABELS.find(
+                            label =>
+                              label.value ===
+                              cropClassification.labelAutoUpdated,
+                          )?.label ?? cropClassification.labelAutoUpdated}{' '}
+                          (prediction above 60%)
+                        </Text>
+                      ) : null}
                       <Box mt="$2" flexDirection="row" flexWrap="wrap" gap="$2">
                         {Object.entries(
                           cropClassification.response.all_probabilities,
@@ -1532,12 +1615,12 @@ function AbracadabraScreen(): React.JSX.Element {
                     </Text>
                   ) : null}
                 </Box>
-              ) : (
+              ) : isFocused ? (
                 <Text mt="$3" color="#94a3b8" fontSize="$sm" fontFamily="Menlo">
-                  Move the crop sliders and tap Select crop to stage samples for
-                  labeling.
+                  Move the crop sliders to stage samples for labeling.
                 </Text>
-              )}
+              ) : null}
+              {isFocused ? (
               <Box
                 mt="$4"
                 p="$3"
@@ -1558,7 +1641,7 @@ function AbracadabraScreen(): React.JSX.Element {
                     {lastRecording.samples.length} samples
                   </Text>
                 </HStack>
-                <Button
+                <NeonButton
                   mt="$3"
                   size="sm"
                   alignSelf="flex-start"
@@ -1585,7 +1668,7 @@ function AbracadabraScreen(): React.JSX.Element {
                       ? 'Analyzing...'
                       : 'Analyze full recording'}
                   </ButtonText>
-                </Button>
+                </NeonButton>
                 {recordingAnalysis.status === 'analyzed' ? (
                   <Box mt="$4">
                     <Text
@@ -1649,7 +1732,7 @@ function AbracadabraScreen(): React.JSX.Element {
                         </Text>
                       ) : null}
                       <HStack mt="$3" space="sm" alignItems="center">
-                        <Button
+                        <NeonButton
                           flex={1}
                           size="sm"
                           borderRadius="$xl"
@@ -1665,8 +1748,8 @@ function AbracadabraScreen(): React.JSX.Element {
                             textTransform="uppercase">
                             Save as password
                           </ButtonText>
-                        </Button>
-                        <Button
+                        </NeonButton>
+                        <NeonButton
                           flex={1}
                           size="sm"
                           variant="outline"
@@ -1684,7 +1767,7 @@ function AbracadabraScreen(): React.JSX.Element {
                             textTransform="uppercase">
                             Clear password
                           </ButtonText>
-                        </Button>
+                        </NeonButton>
                       </HStack>
                     </Box>
                     <Box mt="$3" gap="$2">
@@ -1722,6 +1805,7 @@ function AbracadabraScreen(): React.JSX.Element {
                   </Text>
                 ) : null}
               </Box>
+              ) : null}
             </Box>
           ) : null}
 
@@ -1814,7 +1898,7 @@ function AbracadabraScreen(): React.JSX.Element {
             ) : null}
 
             <HStack mt="$4" space="sm" alignItems="center">
-              <Button
+              <NeonButton
                 flex={1}
                 size="sm"
                 variant="outline"
@@ -1840,8 +1924,8 @@ function AbracadabraScreen(): React.JSX.Element {
                   textTransform="uppercase">
                   {modelPanel.status === 'loading' ? 'Refreshing...' : 'Refresh'}
                 </ButtonText>
-              </Button>
-              <Button
+              </NeonButton>
+              <NeonButton
                 flex={1}
                 size="sm"
                 borderRadius="$xl"
@@ -1869,13 +1953,13 @@ function AbracadabraScreen(): React.JSX.Element {
                     ? 'Training...'
                     : 'Train model'}
                 </ButtonText>
-              </Button>
+              </NeonButton>
             </HStack>
           </Box>
 
           {!scanning && scanOutcome !== 'idle' ? (
             <HStack space="md" mt="$5" alignItems="stretch">
-              <Button
+              <NeonButton
                 flex={1}
                 size="lg"
                 borderRadius="$2xl"
@@ -1886,8 +1970,8 @@ function AbracadabraScreen(): React.JSX.Element {
                 <ButtonText color="#020617" fontWeight="$extrabold" letterSpacing="$md" fontSize="$md">
                   {scanning ? 'Finding...' : 'Scan again'}
                 </ButtonText>
-              </Button>
-              <Button
+              </NeonButton>
+              <NeonButton
                 w={100}
                 size="lg"
                 variant="outline"
@@ -1900,7 +1984,7 @@ function AbracadabraScreen(): React.JSX.Element {
                 <ButtonText color="#f0abfc" fontWeight="$extrabold" letterSpacing="$lg">
                   Stop
                 </ButtonText>
-              </Button>
+              </NeonButton>
             </HStack>
           ) : null}
 

@@ -1,7 +1,8 @@
 import React from 'react';
 import type {BottomTabBarProps} from '@react-navigation/bottom-tabs';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
-import {Box, HStack, Pressable, Text, VStack} from '@gluestack-ui/themed';
+import {Box, HStack, Text, VStack} from '@gluestack-ui/themed';
+import {NeonPressable} from '../ui/NeonPressable';
 
 const ACCENT: Record<string, string> = {
   Vault: '#22d3ee',
@@ -50,9 +51,9 @@ export function NeonTabBar({
           };
 
           return (
-            <Pressable
+            <NeonPressable
               key={route.key}
-              flex={1}
+              style={{flex: 1}}
               onPress={onPress}
               accessibilityRole="button"
               accessibilityState={isFocused ? {selected: true} : {}}>
@@ -73,7 +74,7 @@ export function NeonTabBar({
                   {label}
                 </Text>
               </VStack>
-            </Pressable>
+            </NeonPressable>
           );
         })}
       </HStack>

@@ -4,13 +4,10 @@ import {useRoute} from '@react-navigation/native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {
   Box,
-  Button,
-  ButtonText,
   HStack,
   Heading,
   Input,
   InputField,
-  Pressable,
   Text,
   VStack,
 } from '@gluestack-ui/themed';
@@ -18,6 +15,7 @@ import {
 import type {PasswordMovementType} from '../../gestureApi';
 import {describeAction, formatSequence, type UnlockAction} from '../store/spell';
 import {useSpellbookStore} from '../store/spellbookStore';
+import {NeonButton, ButtonText, NeonPressable} from '../ui';
 
 type ActionType = UnlockAction['type'];
 
@@ -170,7 +168,7 @@ export function SpellbookScreen(): React.JSX.Element {
               {ACTION_TYPES.map(option => {
                 const active = option.value === actionType;
                 return (
-                  <Pressable
+                  <NeonPressable
                     key={option.value}
                     onPress={() => setActionType(option.value)}>
                     <Box
@@ -188,7 +186,7 @@ export function SpellbookScreen(): React.JSX.Element {
                         {option.label}
                       </Text>
                     </Box>
-                  </Pressable>
+                  </NeonPressable>
                 );
               })}
             </HStack>
@@ -198,7 +196,7 @@ export function SpellbookScreen(): React.JSX.Element {
                 {(['GET', 'POST'] as const).map(m => {
                   const active = m === method;
                   return (
-                    <Pressable key={m} onPress={() => setMethod(m)}>
+                    <NeonPressable key={m} onPress={() => setMethod(m)}>
                       <Box
                         px="$3"
                         py="$2"
@@ -213,7 +211,7 @@ export function SpellbookScreen(): React.JSX.Element {
                           {m}
                         </Text>
                       </Box>
-                    </Pressable>
+                    </NeonPressable>
                   );
                 })}
               </HStack>
@@ -250,7 +248,7 @@ export function SpellbookScreen(): React.JSX.Element {
               </Input>
             ) : null}
 
-            <Button
+            <NeonButton
               mt="$4"
               borderRadius="$xl"
               bg="#00f5ff"
@@ -265,7 +263,7 @@ export function SpellbookScreen(): React.JSX.Element {
                 textTransform="uppercase">
                 Save spell
               </ButtonText>
-            </Button>
+            </NeonButton>
           </Box>
 
           <VStack space="md">
@@ -300,7 +298,7 @@ export function SpellbookScreen(): React.JSX.Element {
                   <Text color="$coolGray50" fontWeight="$bold" fontSize="$md">
                     {spell.name}
                   </Text>
-                  <Pressable onPress={() => toggleSpell(spell.id)}>
+                  <NeonPressable onPress={() => toggleSpell(spell.id)}>
                     <Box
                       px="$2"
                       py="$1"
@@ -314,7 +312,7 @@ export function SpellbookScreen(): React.JSX.Element {
                         {spell.enabled ? 'Armed' : 'Off'}
                       </Text>
                     </Box>
-                  </Pressable>
+                  </NeonPressable>
                 </HStack>
                 <Text mt="$2" color="#e0f2fe" fontFamily="Menlo" fontSize="$xs">
                   {formatSequence(spell.sequence)}
@@ -322,7 +320,7 @@ export function SpellbookScreen(): React.JSX.Element {
                 <Text mt="$1" color="#94a3b8" fontFamily="Menlo" fontSize="$xs">
                   {describeAction(spell.action)}
                 </Text>
-                <Button
+                <NeonButton
                   mt="$3"
                   size="sm"
                   variant="outline"
@@ -338,7 +336,7 @@ export function SpellbookScreen(): React.JSX.Element {
                     textTransform="uppercase">
                     Delete
                   </ButtonText>
-                </Button>
+                </NeonButton>
               </Box>
             ))}
           </VStack>

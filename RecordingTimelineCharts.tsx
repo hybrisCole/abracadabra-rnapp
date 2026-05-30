@@ -3,13 +3,11 @@
  */
 
 import Slider from '@react-native-community/slider';
-import React, {useEffect, useMemo, useReducer} from 'react';
+import React, {useCallback, useEffect, useMemo, useReducer} from 'react';
 import {Dimensions, StyleSheet, Text, View} from 'react-native';
 import Svg, {Line, Polyline, Rect} from 'react-native-svg';
 
 import {
-  Button,
-  ButtonText,
   Tabs,
   TabsTab,
   TabsTabList,
@@ -61,6 +59,28 @@ export type CropSelection = {
   tMsLastInCrop: number | null;
   samples: ImuSample[];
 };
+
+function buildCropSelection(
+  samples: ImuSample[],
+  windowId: number,
+  cropStart: number,
+  cropEnd: number,
+): CropSelection {
+  const lo = Math.min(cropStart, cropEnd);
+  const hi = Math.max(cropStart, cropEnd);
+  const cropped = samples.filter(s => s.t_ms >= lo && s.t_ms <= hi);
+  return {
+    windowId,
+    cropStartMs: lo,
+    cropEndMs: hi,
+    durationMs: hi - lo,
+    samplesTotal: samples.length,
+    samplesInCrop: cropped.length,
+    tMsFirstInCrop: cropped[0]?.t_ms ?? null,
+    tMsLastInCrop: cropped[cropped.length - 1]?.t_ms ?? null,
+    samples: cropped,
+  };
+}
 
 type RecordingTimelineChartsProps = {
   samples: ImuSample[];
@@ -418,6 +438,52 @@ export function RecordingTimelineCharts({
   const cropResetTMin = prepared?.tMin;
   const cropResetTMax = prepared?.tMax;
 
+  const commitCropSelection = useCallback(
+    (range: CropMsRange): void => {
+      if (!onCropSelected || samples.length === 0) {
+        return;
+      }
+      if (cropResetTMin == null || cropResetTMax == null) {
+        return;
+      }
+      if (
+        range.start < cropResetTMin ||
+        range.end > cropResetTMax ||
+        range.end < range.start
+      ) {
+        return;
+      }
+      const selection = buildCropSelection(
+        samples,
+        windowId,
+        range.start,
+        range.end,
+      );
+      onCropSelected(selection);
+      if (__DEV__) {
+        const summary = {
+          ...selection,
+          samples: `${selection.samples.length} selected samples`,
+        };
+        console.log('[TimelineCrop]', JSON.stringify(summary, null, 2));
+      }
+    },
+    [cropResetTMax, cropResetTMin, onCropSelected, samples, windowId],
+  );
+
+  const applyCropAction = useCallback(
+    (action: CropAction, commit: boolean): void => {
+      const next = cropReducer(crop, action);
+      if (next.start !== crop.start || next.end !== crop.end) {
+        dispatchCrop(action);
+      }
+      if (commit) {
+        commitCropSelection(next);
+      }
+    },
+    [commitCropSelection, crop],
+  );
+
   useEffect(() => {
     if (cropResetTMin == null || cropResetTMax == null) {
       return;
@@ -427,7 +493,8 @@ export function RecordingTimelineCharts({
       tMin: cropResetTMin,
       tMax: cropResetTMax,
     });
-  }, [cropResetTMin, cropResetTMax, windowId]);
+    commitCropSelection({start: cropResetTMin, end: cropResetTMax});
+  }, [commitCropSelection, cropResetTMin, cropResetTMax, windowId]);
 
   if (!prepared) {
     return (
@@ -463,37 +530,6 @@ export function RecordingTimelineCharts({
     tMax,
     cropStart: crop.start,
     cropEnd: crop.end,
-  };
-
-  const selectCrop = (): void => {
-    const lo = Math.min(crop.start, crop.end);
-    const hi = Math.max(crop.start, crop.end);
-    const cropped = samples.filter(s => s.t_ms >= lo && s.t_ms <= hi);
-    const selection: CropSelection = {
-      windowId,
-      cropStartMs: lo,
-      cropEndMs: hi,
-      durationMs: hi - lo,
-      samplesTotal: samples.length,
-      samplesInCrop: cropped.length,
-      tMsFirstInCrop: cropped[0]?.t_ms ?? null,
-      tMsLastInCrop: cropped[cropped.length - 1]?.t_ms ?? null,
-      samples: cropped,
-    };
-
-    onCropSelected?.(selection);
-
-    if (__DEV__) {
-      const summary = {
-        ...selection,
-        samples: `${selection.samples.length} selected samples`,
-      };
-      console.log('[TimelineCrop]', JSON.stringify(summary, null, 2));
-      if (cropped.length > 0) {
-        console.log('[TimelineCrop] first sample', cropped[0]);
-        console.log('[TimelineCrop] last sample', cropped[cropped.length - 1]);
-      }
-    }
   };
 
   const spanMs = Math.max(tMax - tMin, 1);
@@ -717,9 +753,17 @@ export function RecordingTimelineCharts({
             value={crop.start}
             onValueChange={v => {
               const nextStart = Math.round(Math.min(Math.max(v, tMin), tMax));
-              if (nextStart !== crop.start) {
-                dispatchCrop({type: 'setStart', value: nextStart, tMin, tMax});
-              }
+              applyCropAction(
+                {type: 'setStart', value: nextStart, tMin, tMax},
+                false,
+              );
+            }}
+            onSlidingComplete={v => {
+              const nextStart = Math.round(Math.min(Math.max(v, tMin), tMax));
+              applyCropAction(
+                {type: 'setStart', value: nextStart, tMin, tMax},
+                true,
+              );
             }}
             minimumTrackTintColor="rgba(34,211,238,0.55)"
             maximumTrackTintColor="rgba(51,65,85,0.85)"
@@ -738,9 +782,17 @@ export function RecordingTimelineCharts({
             value={crop.end}
             onValueChange={v => {
               const nextEnd = Math.round(Math.min(Math.max(v, tMin), tMax));
-              if (nextEnd !== crop.end) {
-                dispatchCrop({type: 'setEnd', value: nextEnd, tMin, tMax});
-              }
+              applyCropAction(
+                {type: 'setEnd', value: nextEnd, tMin, tMax},
+                false,
+              );
+            }}
+            onSlidingComplete={v => {
+              const nextEnd = Math.round(Math.min(Math.max(v, tMin), tMax));
+              applyCropAction(
+                {type: 'setEnd', value: nextEnd, tMin, tMax},
+                true,
+              );
             }}
             minimumTrackTintColor="rgba(244,114,182,0.55)"
             maximumTrackTintColor="rgba(51,65,85,0.85)"
@@ -748,24 +800,6 @@ export function RecordingTimelineCharts({
           />
           <Text style={styles.sliderValue}>{crop.end} ms</Text>
         </View>
-        <Button
-          size="sm"
-          mt="$2"
-          alignSelf="flex-start"
-          borderRadius="$lg"
-          bg="rgba(217,70,239,0.35)"
-          borderWidth={1}
-          borderColor="rgba(217,70,239,0.75)"
-          onPress={selectCrop}>
-          <ButtonText
-            color="#f9a8d4"
-            fontWeight="$extrabold"
-            letterSpacing="$md"
-            fontSize="$xs"
-            textTransform="uppercase">
-            Select crop
-          </ButtonText>
-        </Button>
       </View>
 
       <Text style={styles.footer}>

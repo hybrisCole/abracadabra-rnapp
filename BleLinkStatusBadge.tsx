@@ -10,11 +10,11 @@ import {
   Badge,
   Box,
   HStack,
-  Pressable,
   Text,
   useToast,
   VStack,
 } from '@gluestack-ui/themed';
+import {NeonPressable} from './src/ui/NeonPressable';
 
 export type LinkBadgeStatus =
   | 'disconnected'
@@ -181,15 +181,17 @@ export function BleLinkStatusBadge({
             : 'rgba(34,211,238,0.42)'
       }>
       <HStack alignItems="center" flex={1} space="sm">
-        <Pressable
+        <NeonPressable
           onPress={toggleDetailToast}
           accessibilityRole="button"
           accessibilityLabel="Show or hide link details"
-          width="30%"
-          maxWidth="30%"
-          alignItems="center"
-          justifyContent="center"
-          hitSlop={{top: 10, bottom: 10, left: 10, right: 10}}>
+          hitSlop={{top: 10, bottom: 10, left: 10, right: 10}}
+          style={{
+            width: '30%',
+            maxWidth: '30%',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}>
           <Animated.View
             style={[
               styles.orbAnimWrap,
@@ -218,7 +220,7 @@ export function BleLinkStatusBadge({
               <Box w={10} h={10} borderRadius="$full" bg={theme.core} />
             </Box>
           </Animated.View>
-        </Pressable>
+        </NeonPressable>
         <Box
           flex={1}
           justifyContent="center"

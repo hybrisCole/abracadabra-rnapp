@@ -4,8 +4,6 @@ import {useIsFocused, useNavigation} from '@react-navigation/native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {
   Box,
-  Button,
-  ButtonText,
   HStack,
   Heading,
   Text,
@@ -22,6 +20,7 @@ import {formatSequence, matchSpell} from '../store/spell';
 import {selectVaultStatus, useSessionStore} from '../store/sessionStore';
 import {useSpellbookStore} from '../store/spellbookStore';
 import type {VaultStatus} from '../store/selectors';
+import {NeonButton, ButtonText} from '../ui';
 
 const RESULT_HOLD_MS = 6000;
 
@@ -247,7 +246,7 @@ export function VaultScreen(): React.JSX.Element {
                 ? formatSequence(lastDetected)
                 : 'Cast a gesture to see it here'}
             </Text>
-            <Button
+            <NeonButton
               mt="$4"
               size="sm"
               borderRadius="$xl"
@@ -265,7 +264,7 @@ export function VaultScreen(): React.JSX.Element {
                 textTransform="uppercase">
                 Bind this gesture to a spell
               </ButtonText>
-            </Button>
+            </NeonButton>
           </Box>
         </VStack>
       </ScrollView>

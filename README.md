@@ -12,7 +12,7 @@ What this repo is today:
   - **`COMMIT` (`pkt = 3`):** transfer-end marker — **`window_id`**, **`total_bytes`**, **CRC-32**, protocol version. The app only accepts the recording when every byte is present and **CRC + sample decode** pass.
   This changes **transport only**: sample rate, raw `int16` axes, `t_ms`, and model input quality remain identical. The old **`ADAB0004`** / **`ADAB0005`** GATT pull path remains in protocol code as a compatibility/diagnostic fallback. The iPhone app path prefers notify chunks to avoid repeated write-offset + read-slice round trips, then automatically recovers with GATT pull if **COMMIT** arrives before every notify byte was received.
 - **Link UI:** **`BleLinkStatusBadge.tsx`** shows a compact capsule (**Gluestack Badge**-style): animated orb (≤30% width) + status label (**Connecting**, **Connected**, **Linked**, **Recording**, **Processing**, **Retry**, **Disconnected**). Tap the orb for a short detail **toast** (session/RSSI/GATT copy). After notify chunks complete, the badge shows **Processing** while **`finalizeRecordingPayload`** verifies CRC and unpacks samples before the timeline appears.
-- **Recording UI:** Verified recordings show a **Recording timeline** card with **[Gluestack Tabs](https://gluestack.io/ui)** switching SVG charts in **`RecordingTimelineCharts.tsx`**: **ACC RAW**, **GYRO RAW**, **ACC MAG** (‖a‖), **GYRO MAG** (‖ω‖), **ALL MAG** (‖a‖ and ‖ω‖ each min–max normalized to 0…1 for shape comparison), **ALL RAW** (six raw axes each min–max normalized the same way). A **window time** strip shows **`t_ms`** range from the samples (nominal **index × 5 ms** on the MCU—see firmware README); it is **not** BLE transfer duration. **Crop timeline** sliders use **`@react-native-community/slider`** (run **`bundle exec pod install`** under **`ios/`** after install).
+- **Recording UI:** Verified recordings show a **Recording timeline** card with **[Gluestack Tabs](https://gluestack.io/ui)** switching SVG charts in **`RecordingTimelineCharts.tsx`**: **ACC RAW**, **GYRO RAW**, **ACC MAG** (‖a‖), **GYRO MAG** (‖ω‖), **ALL MAG** (‖a‖ and ‖ω‖ each min–max normalized to 0…1 for shape comparison), **ALL RAW** (six raw axes each min–max normalized the same way). A **window time** strip shows **`t_ms`** range from the samples (nominal **index × 5 ms** on the MCU—see firmware README); it is **not** BLE transfer duration. **Crop timeline** sliders use **`@react-native-community/slider`** (run **`bundle exec pod install`** under **`ios/`** after install). Moving **start** / **end** updates the chart overlay live; the staged crop commits to Training when you **release** the slider (`onSlidingComplete`), and a new recording auto-stages the full window once.
 - **Gesture ML flow:** The app’s decoded recording shape is the source of truth for **`abracadabra_gesture_processing`**. A recording is **`{ windowId, samples: [{ t_ms, ax, ay, az, gx, gy, gz }] }`**. Cropped timeline windows can be labeled as **`tap`**, **`double_tap`**, **`still`** / **silence**, or **`wrist_rotation`** and uploaded as JSON training samples. The app can refresh server/model status, train the Random Forest model, classify a selected crop, and analyze a full 3–4 s recording. Full-recording analyze returns **raw** `segments` (overlapping sliding-window hits—e.g. separate `tap` windows inside a `double_tap`) plus **`resolved_segments`** and **`sequence`** after server precedence (`wrist_rotation` > `double_tap` > `tap` > `still`). **`gestureApi.analyzeRecording`** normalizes every response; **`segmentResolve.ts`** mirrors the same rules client-side if an older server omits those fields. The UI shows resolved segments for the password line and segment list; raw count is labeled **raw** for debugging. Gestures below **50%** confidence are excluded from resolve and the password sequence (`min_confidence: 0.5` on analyze). Password save/match uses **`analysisToPasswordSequence()`** (never raw segment order). `t_ms` / `windowId` are metadata for ordering, timing, tracing, and UI mapping—not model features.
 - **Native integration:** Safe area uses **`react-native-safe-area-context`** (`useSafeAreaInsets`), not deprecated RN `SafeAreaView`. **Skia** is used for the **NeonBackdrop** gradient (main hero orb was replaced by the link badge).
 - **Install / Metro:** **`.npmrc`** sets **`legacy-peer-deps=true`** so Gluestack’s peer graph resolves cleanly. **`metro.config.js`** aliases **`react-dom`** to **`rn-shims/react-dom`** because Gluestack pulls **react-aria**, which expects **`flushSync`** from `react-dom` (not shipped on React Native).
@@ -41,7 +41,7 @@ GestureHandlerRootView
 ```
 
 - **`lazy: false` is deliberate.** The **Training** screen (`AbracadabraScreen`) owns the BLE radio, the scan/connect/reconnect effects, the NOTIFY transfer assembler, and all ML/training calls — exactly as before. Mounting it eagerly keeps the radio connected and recordings flowing **even while the Vault tab is on top**.
-- **Custom tab bar:** `src/navigation/NeonTabBar.tsx` renders neon labels with a glowing active indicator (no header chrome).
+- **Custom tab bar:** `src/navigation/NeonTabBar.tsx` renders neon labels with a glowing active indicator (no header chrome). Tab items use the shared press feedback wrappers in **`src/ui/`** (scale + haptic).
 
 ### Shared state (zustand) — `src/store/`
 
@@ -60,7 +60,7 @@ The Vault is the main screen: a large **Skia reactor HUD** (`src/game/VaultHud.t
 
 **Performance:** Training stays mounted (`lazy: false`) for BLE, but each tab’s `NeonBackdrop` / `VaultHud` only runs its animation loop while that tab is **focused** (`useIsFocused` + `active` prop). On Vault, the backdrop targets ~24 fps and the HUD ~40 fps so the moving ring dot does not compete with a second full-screen Skia loop from Training.
 
-During NOTIFY receive, chunk bytes update a **ref** only; `recvReceiving` (published to Vault via zustand) flips on transfer start/end. Training’s byte counter in the link badge toast is throttled (~200 ms / 1% steps). Vault does not re-render per chunk.
+During NOTIFY receive, chunk bytes update a **ref** only; `recvReceiving` (published to Vault via zustand) flips on transfer start/end. Training’s byte counter in the link badge toast is throttled (~200 ms / 1% steps). Vault does not re-render per chunk. The NOTIFY stall watchdog reschedules at most every ~500 ms (not on every chunk). **`RecordingTimelineCharts`** mount only while the Training tab is focused. Sequential NOTIFY chunks use a fast contiguous receive path in **`bleRecordingProtocol.ts`**.
 
 Game loop (only while the Vault tab is **focused**, via `useIsFocused`):
 
@@ -91,6 +91,15 @@ Create / enable / delete spells. A new spell binds the **gesture sequence cast i
 ### Haptics — `src/game/haptics.ts`
 
 Thin guarded wrapper over `react-native-haptic-feedback` (iOS Taptic Engine). A missing native module no-ops instead of crashing.
+
+### UI press feedback — `src/ui/`
+
+Gluestack **`Button`** / **`Pressable`** do not show a clear pressed state on device, so interactive controls use thin wrappers:
+
+- **`NeonButton`** — drop-in for Gluestack `Button`: Reanimated scale (~0.96) + opacity dip while pressed, spring back on release, light **`select`** haptic when enabled.
+- **`NeonPressable`** — React Native `Pressable` with the same animation (tab bar, spellbook chips, link-badge orb tap).
+
+Used across **Training** (`App.tsx`), **Vault**, **Spellbook**, timeline charts, and **`BleLinkStatusBadge`**.
 
 ### Native setup for the new dependencies
 
@@ -135,7 +144,7 @@ The gesture server is a JSON-only FastAPI service intended to consume this app�
 - **Classify one crop:** `POST /api/recordings/classify`.
 - **Analyze gesture password recording:** `POST /api/recordings/analyze` with a full 3–4 s recording (response includes `segments`, `resolved_segments`, `sequence`).
 
-The Classify workflow uses the recording timeline crop sliders to stage samples, choose a label, upload training crops, and classify the staged crop after the model is trained. The full-recording analysis workflow sends the entire latest recording to the server and displays **`sequence`** (e.g. `double_tap → wrist_rotation → tap`) plus **resolved** timed segments. Overlapping raw detections are expected; do not build the password from raw `segments` alone. The current password comparison is local and in-memory: save the resolved sequence as the expected password, then analyze later recordings to show match/mismatch. See **`abracadabra_gesture_processing`** README for precedence rules. The server stores JSON training samples and the trained Random Forest model on its Railway volume, so training and inference should use the same raw sample units.
+The **Training** crop workflow: adjust **start** / **end** sliders (overlay updates while dragging; staged crop commits on finger-up), pick a **training label**, **Upload crop**, then **Classify crop** after the model is trained. If classify returns a different movement than the selected label with **confidence > 60%**, the app switches the label to the prediction (server **`silence`** maps to UI **still**). Changing the crop clears pending upload/classify state. The full-recording analysis workflow sends the entire latest recording to the server and displays **`sequence`** (e.g. `double_tap → wrist_rotation → tap`) plus **resolved** timed segments. Overlapping raw detections are expected; do not build the password from raw `segments` alone. The current password comparison is local and in-memory: save the resolved sequence as the expected password, then analyze later recordings to show match/mismatch. See **`abracadabra_gesture_processing`** README for precedence rules. The server stores JSON training samples and the trained Random Forest model on its Railway volume, so training and inference should use the same raw sample units.
 
 ### Scan list: name vs UUID (iOS)
 

@@ -408,11 +408,17 @@ export class RecordingAssembler {
       }
 
       transfer.payload.set(packet.subarray(dataStart, dataEnd), offset);
-      for (let i = 0; i < dataLen; i++) {
-        const at = offset + i;
-        if (transfer.receivedMask[at] === 0) {
-          transfer.receivedMask[at] = 1;
-          transfer.receivedBytes += 1;
+      if (offset === transfer.receivedBytes) {
+        // NOTIFY firmware streams contiguous chunks from 0; skip per-byte mask walk.
+        transfer.receivedBytes += dataLen;
+        transfer.receivedMask.fill(1, offset, offset + dataLen);
+      } else {
+        for (let i = 0; i < dataLen; i++) {
+          const at = offset + i;
+          if (transfer.receivedMask[at] === 0) {
+            transfer.receivedMask[at] = 1;
+            transfer.receivedBytes += 1;
+          }
         }
       }
       if (
