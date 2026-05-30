@@ -168,7 +168,11 @@ export function VaultScreen(): React.JSX.Element {
 
   return (
     <Box flex={1} bg="#020617">
-      <NeonBackdrop variant={backdropForStatus(status)} />
+      <NeonBackdrop
+        variant={backdropForStatus(status)}
+        active={isFocused}
+        targetFps={24}
+      />
       <ScrollView
         contentContainerStyle={[
           styles.scroll,
@@ -195,7 +199,7 @@ export function VaultScreen(): React.JSX.Element {
           </VStack>
 
           <Box mt="$4">
-            <VaultHud status={status} message={message} />
+            <VaultHud status={status} message={message} active={isFocused} />
           </Box>
 
           {matchedSpell != null && vaultResult === 'unlocked' ? (

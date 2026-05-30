@@ -13,7 +13,7 @@ import {Box, Text, VStack} from '@gluestack-ui/themed';
 import type {VaultStatus} from '../store/selectors';
 
 const TAU = Math.PI * 2;
-const MIN_FRAME_MS = 1000 / 50;
+const DEFAULT_TARGET_FPS = 40;
 
 type HudTheme = {core: string; ring: string; glow: string; spin: number; pulse: number};
 
@@ -51,9 +51,14 @@ const LABEL: Record<VaultStatus, string> = {
 export function VaultHud({
   status,
   message,
+  active = true,
+  targetFps = DEFAULT_TARGET_FPS,
 }: {
   status: VaultStatus;
   message?: string | null;
+  /** When false, freeze animation (tab not focused). */
+  active?: boolean;
+  targetFps?: number;
 }): React.JSX.Element {
   const {width} = useWindowDimensions();
   const size = Math.min(width * 0.82, 360);
@@ -63,15 +68,19 @@ export function VaultHud({
 
   const canvasRef = useCanvasRef();
   const [phase, setPhase] = useState(0);
+  const minFrameMs = 1000 / Math.max(1, targetFps);
 
   useEffect(() => {
+    if (!active) {
+      return;
+    }
     let raf = 0;
     const t0 = Date.now();
     let lastEmit = 0;
     const loop = () => {
       raf = requestAnimationFrame(loop);
       const now = Date.now();
-      if (now - lastEmit < MIN_FRAME_MS) {
+      if (now - lastEmit < minFrameMs) {
         return;
       }
       lastEmit = now;
@@ -79,7 +88,7 @@ export function VaultHud({
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, []);
+  }, [active, minFrameMs]);
 
   const frame = useMemo(() => {
     const pulse = (Math.sin(phase * TAU * theme.pulse) + 1) / 2; // 0..1
@@ -93,7 +102,7 @@ export function VaultHud({
 
   useLayoutEffect(() => {
     canvasRef.current?.redraw();
-  }, [frame, canvasRef, theme]);
+  }, [frame, canvasRef, theme, status, active]);
 
   return (
     <VStack alignItems="center" justifyContent="center">
@@ -101,7 +110,7 @@ export function VaultHud({
         <Canvas ref={canvasRef} style={StyleSheet.absoluteFill}>
           {/* outer glow */}
           <Circle cx={cx} cy={cy} r={frame.glowR} color={theme.glow} opacity={0.45}>
-            <BlurMask blur={48} style="normal" />
+            <BlurMask blur={36} style="normal" />
           </Circle>
           {/* rotating outer ring */}
           <Group
@@ -116,9 +125,7 @@ export function VaultHud({
               strokeWidth={2.5}
               opacity={0.8}
             />
-            <Circle cx={cx} cy={cy - frame.ringR} r={4} color={theme.core}>
-              <BlurMask blur={6} style="solid" />
-            </Circle>
+            <Circle cx={cx} cy={cy - frame.ringR} r={4} color={theme.core} />
           </Group>
           {/* counter-rotating inner ring */}
           <Group
@@ -136,7 +143,7 @@ export function VaultHud({
           </Group>
           {/* core */}
           <Circle cx={cx} cy={cy} r={frame.coreR} color={theme.core}>
-            <BlurMask blur={18} style="solid" />
+            <BlurMask blur={14} style="solid" />
           </Circle>
         </Canvas>
 

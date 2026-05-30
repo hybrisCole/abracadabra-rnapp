@@ -57,7 +57,7 @@ import {
   type CropSelection,
 } from './RecordingTimelineCharts';
 import {GestureHandlerRootView} from 'react-native-gesture-handler';
-import {DarkTheme, NavigationContainer} from '@react-navigation/native';
+import {DarkTheme, NavigationContainer, useIsFocused} from '@react-navigation/native';
 import {
   createBottomTabNavigator,
   type BottomTabBarProps,
@@ -70,6 +70,10 @@ import {SpellbookScreen} from './src/screens/SpellbookScreen';
 
 const TARGET_BLE_NAME = 'XA_Abracadabra';
 const SCAN_DURATION_MS = 5000;
+/** Training link-detail byte counter only — Vault uses recvReceiving (start/end). */
+const RECV_PROGRESS_UI_MS = 200;
+
+type RecvProgress = {filled: number; total: number};
 const NOTIFY_STREAM_STALL_MS = 4500;
 
 /** Decorative hero title (combining marks); VoiceOver uses accessibilityLabel below. */
@@ -207,6 +211,7 @@ const isTargetDevice = (device: {
 }) => isTargetName(device.localName) || isTargetName(device.name);
 
 function AbracadabraScreen(): React.JSX.Element {
+  const isFocused = useIsFocused();
   const managerRef = useRef<BleManager | null>(null);
   const managerDestroyedRef = useRef(false);
   const scanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -228,10 +233,12 @@ function AbracadabraScreen(): React.JSX.Element {
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
 
   const [connPhase, setConnPhase] = useState<ConnPhase>('off');
-  const [recvProgress, setRecvProgress] = useState<{
-    filled: number;
-    total: number;
-  } | null>(null);
+  /** True for whole NOTIFY/GATT receive — published to Vault once per transfer, not per chunk. */
+  const [recvReceiving, setRecvReceiving] = useState(false);
+  const [recvProgress, setRecvProgress] = useState<RecvProgress | null>(null);
+  const recvProgressRef = useRef<RecvProgress | null>(null);
+  const recvUiLastEmitRef = useRef(0);
+  const recvUiPercentRef = useRef(-1);
   /** Firmware NOTIFY RECORDING_PENDING — onboard capture not finished yet. */
   const [wearableCaptureArming, setWearableCaptureArming] = useState<{
     windowId: number;
@@ -284,6 +291,39 @@ function AbracadabraScreen(): React.JSX.Element {
     }
   }, []);
 
+  const beginRecvTransfer = useCallback((filled: number, total: number) => {
+    const next: RecvProgress = {filled, total};
+    recvProgressRef.current = next;
+    recvUiLastEmitRef.current = 0;
+    recvUiPercentRef.current = -1;
+    setRecvReceiving(true);
+    setRecvProgress(next);
+  }, []);
+
+  const endRecvTransfer = useCallback(() => {
+    recvProgressRef.current = null;
+    recvUiLastEmitRef.current = 0;
+    recvUiPercentRef.current = -1;
+    setRecvReceiving(false);
+    setRecvProgress(null);
+  }, []);
+
+  /** Chunk bytes live in a ref; React state throttled for Training UI only. */
+  const reportRecvChunkProgress = useCallback((filled: number, total: number) => {
+    recvProgressRef.current = {filled, total};
+    const now = Date.now();
+    const pct = total > 0 ? Math.floor((100 * filled) / total) : 0;
+    if (
+      pct === recvUiPercentRef.current &&
+      now - recvUiLastEmitRef.current < RECV_PROGRESS_UI_MS
+    ) {
+      return;
+    }
+    recvUiLastEmitRef.current = now;
+    recvUiPercentRef.current = pct;
+    setRecvProgress({filled, total});
+  }, []);
+
   const recoverWithFallbackPull = useCallback(
     (meta: NotifyFallbackMeta) => {
       clearNotifyStreamWatchdog();
@@ -291,7 +331,7 @@ function AbracadabraScreen(): React.JSX.Element {
       assemblerRef.current.reset('fallback pull starting');
       const linkedDev = connectedDevRef.current;
       if (!linkedDev) {
-        setRecvProgress(null);
+        endRecvTransfer();
         setProcessingCapture(false);
         setTransferNote(
           `Notify stream ${meta.reason} ${meta.receivedBytes}/${meta.totalBytes}; not connected for fallback pull`,
@@ -304,19 +344,19 @@ function AbracadabraScreen(): React.JSX.Element {
       console.log('[recording] fallback GATT pull starting', meta);
       setProcessingCapture(false);
       setTransferNote(null);
-      setRecvProgress({filled: meta.receivedBytes, total: meta.totalBytes});
+      beginRecvTransfer(meta.receivedBytes, meta.totalBytes);
 
       pullPackedPayloadFromPeripheral(
         linkedDev,
         meta.totalBytes,
-        (filled, total) => setRecvProgress({filled, total}),
+        reportRecvChunkProgress,
       )
         .then(payload => {
           console.log('[recording] fallback GATT pull complete; finalizing', {
             windowId: meta.windowId,
             bytes: payload.byteLength,
           });
-          setRecvProgress(null);
+          endRecvTransfer();
           setProcessingCapture(true);
           return finalizeRecordingPayload(
             meta.windowId,
@@ -330,7 +370,7 @@ function AbracadabraScreen(): React.JSX.Element {
           if ('error' in fin) {
             console.warn('[recording] fallback finalize failed', fin);
             setTransferNote(fin.error);
-            setRecvProgress(null);
+            endRecvTransfer();
             setWearableCaptureArming(null);
             setConnPhase('linked');
             assemblerRef.current.reset('fallback finalize failed');
@@ -352,7 +392,7 @@ function AbracadabraScreen(): React.JSX.Element {
           }
         })
         .catch(e => {
-          setRecvProgress(null);
+          endRecvTransfer();
           setProcessingCapture(false);
           setWearableCaptureArming(null);
           setConnPhase('linked');
@@ -368,7 +408,12 @@ function AbracadabraScreen(): React.JSX.Element {
           transferInFlightRef.current = false;
         });
     },
-    [clearNotifyStreamWatchdog],
+    [
+      beginRecvTransfer,
+      clearNotifyStreamWatchdog,
+      endRecvTransfer,
+      reportRecvChunkProgress,
+    ],
   );
 
   const armNotifyStreamWatchdog = useCallback(
@@ -466,7 +511,7 @@ function AbracadabraScreen(): React.JSX.Element {
     setTargetDevice(null);
     setHasScanned(false);
     setConnPhase('off');
-    setRecvProgress(null);
+    endRecvTransfer();
     setWearableCaptureArming(null);
     setProcessingCapture(false);
     setTransferNote(null);
@@ -539,7 +584,7 @@ function AbracadabraScreen(): React.JSX.Element {
       setScanning(false);
       setHasScanned(true);
     }, SCAN_DURATION_MS);
-  }, [clearNotifyStreamWatchdog, scanning]);
+  }, [clearNotifyStreamWatchdog, endRecvTransfer, scanning]);
 
   useEffect(() => {
     if (!targetDevice || bleState !== State.PoweredOn) {
@@ -548,7 +593,7 @@ function AbracadabraScreen(): React.JSX.Element {
         reconnectTimerRef.current = null;
       }
       setConnPhase('off');
-      setRecvProgress(null);
+      endRecvTransfer();
       setWearableCaptureArming(null);
       setProcessingCapture(false);
       return () => {};
@@ -601,7 +646,7 @@ function AbracadabraScreen(): React.JSX.Element {
           connectedDevRef.current = null;
           bleMonitorSubRef.current?.remove();
           bleMonitorSubRef.current = null;
-          setRecvProgress(null);
+          endRecvTransfer();
           setWearableCaptureArming(null);
           setProcessingCapture(false);
 
@@ -654,7 +699,7 @@ function AbracadabraScreen(): React.JSX.Element {
               }
               transferInFlightRef.current = true;
               setWearableCaptureArming(null);
-              setRecvProgress({filled: 0, total: result.totalBytes});
+              beginRecvTransfer(0, result.totalBytes);
               console.log('[recording] notify stream started', {
                 windowId: result.windowId,
                 samples: result.samples,
@@ -671,7 +716,7 @@ function AbracadabraScreen(): React.JSX.Element {
               return;
             }
             if (result.kind === 'transfer_progress') {
-              setRecvProgress({filled: result.filled, total: result.total});
+              reportRecvChunkProgress(result.filled, result.total);
               const prior = notifyFallbackMetaRef.current;
               if (prior != null && prior.windowId === result.windowId) {
                 armNotifyStreamWatchdog({
@@ -690,7 +735,7 @@ function AbracadabraScreen(): React.JSX.Element {
                 samples: result.samples,
                 totalBytes: result.totalBytes,
               });
-              setRecvProgress(null);
+              endRecvTransfer();
               setProcessingCapture(true);
               /** Next macrotask so React can paint Processing before sync finalize runs. */
               setTimeout(() => {
@@ -705,7 +750,7 @@ function AbracadabraScreen(): React.JSX.Element {
                   if ('error' in fin) {
                     console.warn('[recording] notify finalize failed', fin);
                     setTransferNote(fin.error);
-                    setRecvProgress(null);
+                    endRecvTransfer();
                     setWearableCaptureArming(null);
                     setConnPhase('linked');
                     assemblerRef.current.reset('finalize failed');
@@ -726,7 +771,7 @@ function AbracadabraScreen(): React.JSX.Element {
                   }
                 })
                 .catch(e => {
-                  setRecvProgress(null);
+                  endRecvTransfer();
                   setProcessingCapture(false);
                   setWearableCaptureArming(null);
                   setConnPhase('linked');
@@ -762,7 +807,7 @@ function AbracadabraScreen(): React.JSX.Element {
               clearNotifyStreamWatchdog();
               notifyFallbackMetaRef.current = null;
               console.warn('[recording] transfer protocol error', result);
-              setRecvProgress(null);
+              endRecvTransfer();
               setTransferNote(result.message);
               transferInFlightRef.current = false;
               assemblerRef.current.reset();
@@ -808,7 +853,7 @@ function AbracadabraScreen(): React.JSX.Element {
           }
         });
       }
-      setRecvProgress(null);
+      endRecvTransfer();
       setWearableCaptureArming(null);
       setProcessingCapture(false);
       transferInFlightRef.current = false;
@@ -876,7 +921,7 @@ function AbracadabraScreen(): React.JSX.Element {
     if (connPhase === 'connecting') {
       return 'connecting';
     }
-    if (processingCapture || recvProgress != null) {
+    if (processingCapture || recvReceiving) {
       return 'processing';
     }
     if (wearableCaptureArming != null) {
@@ -893,7 +938,7 @@ function AbracadabraScreen(): React.JSX.Element {
     targetDevice,
     connPhase,
     reconnectAttempt,
-    recvProgress,
+    recvReceiving,
     wearableCaptureArming,
     processingCapture,
     showFreshConnected,
@@ -1162,7 +1207,7 @@ function AbracadabraScreen(): React.JSX.Element {
       hasTarget: targetDevice != null,
       connPhase,
       reconnectAttempt,
-      recvActive: recvProgress != null,
+      recvActive: recvReceiving,
       arming: wearableCaptureArming != null,
       processingCapture,
       showFreshConnected,
@@ -1175,7 +1220,7 @@ function AbracadabraScreen(): React.JSX.Element {
     targetDevice,
     connPhase,
     reconnectAttempt,
-    recvProgress,
+    recvReceiving,
     wearableCaptureArming,
     processingCapture,
     showFreshConnected,
@@ -1194,7 +1239,7 @@ function AbracadabraScreen(): React.JSX.Element {
       pl={insets.left}
       pr={insets.right}>
       <StatusBar barStyle="light-content" backgroundColor="#020617" />
-      <NeonBackdrop variant={scanOutcome} />
+      <NeonBackdrop variant={scanOutcome} active={isFocused} />
       <ScrollView
         flex={1}
         showsVerticalScrollIndicator

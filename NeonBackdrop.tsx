@@ -27,8 +27,7 @@ const TAU = Math.PI * 2;
  */
 const LOOP_MS = 14_000;
 
-/** Target ~50 fps updates — enough smoothness without hammering reconciliation. */
-const MIN_FRAME_MS = 1000 / 50;
+const DEFAULT_TARGET_FPS = 30;
 
 /** Design reference (original fixed canvas). */
 const DW = 440;
@@ -96,8 +95,14 @@ function blobLayout(progress01: number, W: number, H: number) {
 
 export function NeonBackdrop({
   variant,
+  active = true,
+  targetFps = DEFAULT_TARGET_FPS,
 }: {
   variant: NeonBackdropVariant;
+  /** When false, freeze on the last frame (tab hidden but screen still mounted). */
+  active?: boolean;
+  /** React update rate; lava drift reads well at 20–30 fps. */
+  targetFps?: number;
 }): React.JSX.Element {
   const {width: W, height: H} = useWindowDimensions();
   const accent = variant === 'not-found' ? '#ff3864' : '#00f5ff';
@@ -105,8 +110,12 @@ export function NeonBackdrop({
 
   const canvasRef = useCanvasRef();
   const [phase, setPhase] = useState(0);
+  const minFrameMs = 1000 / Math.max(1, targetFps);
 
   useEffect(() => {
+    if (!active) {
+      return;
+    }
     let raf = 0;
     const t0 = Date.now();
     let lastEmit = 0;
@@ -114,7 +123,7 @@ export function NeonBackdrop({
     const loop = () => {
       raf = requestAnimationFrame(loop);
       const now = Date.now();
-      if (now - lastEmit < MIN_FRAME_MS) {
+      if (now - lastEmit < minFrameMs) {
         return;
       }
       lastEmit = now;
@@ -124,14 +133,14 @@ export function NeonBackdrop({
 
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, []);
+  }, [active, minFrameMs]);
 
   const blobs = useMemo(() => blobLayout(phase, W, H), [phase, W, H]);
 
   /* Ensure native Skia view repaints when JS-driven props change (no Reanimated frame hook). */
   useLayoutEffect(() => {
     canvasRef.current?.redraw();
-  }, [blobs, canvasRef]);
+  }, [blobs, canvasRef, variant, active]);
 
   return (
     <Box pointerEvents="none" position="absolute" top={0} right={0} bottom={0} left={0}>

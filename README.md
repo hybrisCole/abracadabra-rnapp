@@ -58,6 +58,10 @@ The cross-screen state machine lives in zustand; the imperative BLE plumbing sta
 
 The Vault is the main screen: a large **Skia reactor HUD** (`src/game/VaultHud.tsx`) whose color, spin, and pulse react to `selectVaultStatus`. It self-animates with `requestAnimationFrame` (same approach as `NeonBackdrop`; no Reanimated needed for the HUD).
 
+**Performance:** Training stays mounted (`lazy: false`) for BLE, but each tab’s `NeonBackdrop` / `VaultHud` only runs its animation loop while that tab is **focused** (`useIsFocused` + `active` prop). On Vault, the backdrop targets ~24 fps and the HUD ~40 fps so the moving ring dot does not compete with a second full-screen Skia loop from Training.
+
+During NOTIFY receive, chunk bytes update a **ref** only; `recvReceiving` (published to Vault via zustand) flips on transfer start/end. Training’s byte counter in the link badge toast is throttled (~200 ms / 1% steps). Vault does not re-render per chunk.
+
 Game loop (only while the Vault tab is **focused**, via `useIsFocused`):
 
 1. A new recording arrives from the wearable → `recordingNonce` bumps.
