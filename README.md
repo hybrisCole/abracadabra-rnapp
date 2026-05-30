@@ -19,6 +19,93 @@ What this repo is today:
 
 This repo is set up for **iPhone** deployment; the React Native template still includes an `android/` folder.
 
+## App architecture — The Vault (game), Training, Spellbook
+
+> **Node:** every Node/npm/npx command in this repo must run under **Node 26**: `source ~/.nvm/nvm.sh && nvm use 26 && <cmd>`. A bare shell has no `node`/`npm` on PATH. This is also captured as an always-on rule in `.cursor/rules/nodejs-nvm.mdc`.
+
+The app is a **react-navigation** bottom-tab shell with three screens. The wearable link is **inbound-only** (the phone never sends commands to the wearable), so every real-world effect runs on the phone.
+
+### Navigation shell (`App.tsx`)
+
+`App.tsx` composes the providers and the tab navigator:
+
+```
+GestureHandlerRootView
+└─ SafeAreaProvider
+   └─ GluestackUIProvider (dark)
+      └─ NavigationContainer (dark NAV_THEME, #020617)
+         └─ Tab.Navigator (initialRoute "Vault", custom NeonTabBar, headers hidden, lazy: false)
+            ├─ Vault       → src/screens/VaultScreen.tsx   (main game)
+            ├─ Training    → AbracadabraScreen (in App.tsx) (BLE owner + ML training)
+            └─ Spellbook   → src/screens/SpellbookScreen.tsx
+```
+
+- **`lazy: false` is deliberate.** The **Training** screen (`AbracadabraScreen`) owns the BLE radio, the scan/connect/reconnect effects, the NOTIFY transfer assembler, and all ML/training calls — exactly as before. Mounting it eagerly keeps the radio connected and recordings flowing **even while the Vault tab is on top**.
+- **Custom tab bar:** `src/navigation/NeonTabBar.tsx` renders neon labels with a glowing active indicator (no header chrome).
+
+### Shared state (zustand) — `src/store/`
+
+The cross-screen state machine lives in zustand; the imperative BLE plumbing stays in the proven `AbracadabraScreen` component, which **publishes** into the store.
+
+- **`sessionStore.ts`** — live session facts + recording + game outcome.
+  - `AbracadabraScreen` publishes raw `SessionFacts` (bleState, scan outcome, conn phase, reconnect attempt, recv/arming/processing flags) and the latest `DecodedRecording` (+ a `recordingNonce` that increments on each new recording).
+  - `selectVaultStatus(state)` derives the HUD status: `vaultResult` overlay → `analyzing` → live link status.
+- **`selectors.ts`** — `computeLinkStatus(facts)` is the **status state machine ladder ported out of `AbracadabraScreen`'s `useMemo`** into a pure, testable function shared by every screen. `VaultStatus = LinkBadgeStatus | 'analyzing' | 'unlocked' | 'denied'`.
+- **`spellbookStore.ts`** — persisted spell list (CRUD + enable toggle). Backed by **MMKV v4** (`createMMKV`, via `react-native-nitro-modules`) through `zustand/middleware` `persist`. If the native module is not yet linked, it **degrades gracefully to in-memory** so the JS bundle still runs (spells just won't survive a restart until `pod install`).
+- **`spell.ts`** — `Spell` + `UnlockAction` types and pure helpers (`matchSpell`, `sequencesMatch`, `formatSequence`, `describeAction`).
+
+### The Vault game — `src/screens/VaultScreen.tsx` + `src/game/`
+
+The Vault is the main screen: a large **Skia reactor HUD** (`src/game/VaultHud.tsx`) whose color, spin, and pulse react to `selectVaultStatus`. It self-animates with `requestAnimationFrame` (same approach as `NeonBackdrop`; no Reanimated needed for the HUD).
+
+Game loop (only while the Vault tab is **focused**, via `useIsFocused`):
+
+1. A new recording arrives from the wearable → `recordingNonce` bumps.
+2. The Vault calls `gestureApi.analyzeRecording({ ..., include_still: true, min_confidence: 0.5 })` and builds the sequence with `analysisToPasswordSequence()` (server-resolved precedence; **<50%** gestures excluded).
+3. `matchSpell(spells, detected)` looks for the first **enabled** spell whose sequence matches exactly.
+   - **Match → `unlocked`:** runs `executeAction(spell.action)`, success haptic, shows the spell name.
+   - **No match → `denied`:** error haptic, shows the detected sequence.
+4. The result holds for ~6 s then returns to live status.
+
+Manually casting from the Vault and tapping **Bind this gesture to a spell** navigates to the Spellbook with the detected sequence prefilled.
+
+> Training-initiated analysis (the **Analyze full recording** button on the Training tab) is fully separate and **never** fires real-world actions — only the focused Vault tab judges and executes.
+
+### Real-world actions — `src/actions/executeAction.ts`
+
+Because BLE is inbound-only, a matched spell triggers a **phone-side** `UnlockAction`:
+
+- **`open_url`** — `Linking.openURL` (deep links / websites, e.g. YouTube).
+- **`sms`** — opens the iOS Messages composer (`sms:`); iOS requires the user to tap send.
+- **`http`** — `fetch` GET/POST to a webhook (Home Assistant, IFTTT, smart locks/lights) — the universal "do something physical" action.
+- **`notify`** — app-side message surfaced in the HUD.
+
+### Spellbook — `src/screens/SpellbookScreen.tsx`
+
+Create / enable / delete spells. A new spell binds the **gesture sequence cast in the Vault** to one of the action types above. Persisted via the MMKV-backed spellbook store.
+
+### Haptics — `src/game/haptics.ts`
+
+Thin guarded wrapper over `react-native-haptic-feedback` (iOS Taptic Engine). A missing native module no-ops instead of crashing.
+
+### Native setup for the new dependencies
+
+After pulling these changes, install pods and rebuild (the JS bundle is verified, but these are **native** modules that must be linked):
+
+```
+source ~/.nvm/nvm.sh && nvm use 26
+npm install
+cd ios && bundle exec pod install && cd ..
+npx react-native run-ios --device   # or build from Xcode
+```
+
+New native modules: `react-native-screens`, `react-native-gesture-handler`, `react-native-reanimated` (+ `react-native-worklets`), `react-native-mmkv` (+ `react-native-nitro-modules`), `react-native-haptic-feedback`, `lottie-react-native`.
+
+- **Reanimated v4** requires the Worklets Babel plugin — `babel.config.js` lists **`react-native-worklets/plugin` LAST**. Gesture Handler is imported first in **`index.js`** (`import 'react-native-gesture-handler'`). Reanimated v4 expects the **New Architecture** (default on RN 0.85).
+- **`open_url` / `sms` deep links:** if iOS blocks a scheme, add it to `LSApplicationQueriesSchemes` in `Info.plist`.
+
+> **Why the BLE logic was not split into a standalone hook (yet):** the proven ~1.6k-line BLE/recording component (CRC, NOTIFY assembler, fallback pull, reconnect) was kept intact and now simply **publishes to the store**, rather than being blind-retyped into a hook that couldn't be verified on-device here. A pure `useBleSession` extraction is a safe, mechanical follow-up once it can be exercised on hardware.
+
 ## Bluetooth (BLE)
 
 This app uses [**react-native-ble-plx**](https://github.com/dotintent/react-native-ble-plx) to scan, **connect**, discover GATT, and **monitor** **`ADAB0003`** for framed **RECORDING_PENDING** + **META** + **CHUNK** + **COMMIT** packets. The primary device target is **iPhone**; the Android folder remains from the React Native template.

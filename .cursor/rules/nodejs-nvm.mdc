@@ -1,0 +1,31 @@
+---
+description: Use Node 26 via nvm for all Node.js/npm/npx commands
+alwaysApply: true
+---
+
+# Node.js requires `nvm use 26`
+
+This machine manages Node with **nvm**, and a bare shell does NOT have `node`/`npm`
+on PATH. Before ANY Node.js command (`npm`, `npx`, `node`, `react-native`, `pod`
+install that shells out to node, Metro, etc.), load nvm and select Node 26 in the
+SAME shell invocation.
+
+## Always prefix Node commands
+
+```bash
+source ~/.nvm/nvm.sh && nvm use 26 && <your command>
+```
+
+Examples:
+
+```bash
+source ~/.nvm/nvm.sh && nvm use 26 && npm install zustand
+source ~/.nvm/nvm.sh && nvm use 26 && npm start
+source ~/.nvm/nvm.sh && nvm use 26 && npx react-native run-ios --device
+```
+
+Symptom if you forget: `command not found: npm` (or `node`). Re-run with the
+`source ~/.nvm/nvm.sh && nvm use 26 &&` prefix.
+
+The `abracadabra-rnapp` repo also ships a `StartMetro.command` wrapper that does
+this for Metro specifically.

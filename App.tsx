@@ -56,6 +56,17 @@ import {
   RecordingTimelineCharts,
   type CropSelection,
 } from './RecordingTimelineCharts';
+import {GestureHandlerRootView} from 'react-native-gesture-handler';
+import {DarkTheme, NavigationContainer} from '@react-navigation/native';
+import {
+  createBottomTabNavigator,
+  type BottomTabBarProps,
+} from '@react-navigation/bottom-tabs';
+import {useSessionStore} from './src/store/sessionStore';
+import type {SessionFacts} from './src/store/selectors';
+import {NeonTabBar} from './src/navigation/NeonTabBar';
+import {VaultScreen} from './src/screens/VaultScreen';
+import {SpellbookScreen} from './src/screens/SpellbookScreen';
 
 const TARGET_BLE_NAME = 'XA_Abracadabra';
 const SCAN_DURATION_MS = 5000;
@@ -1138,6 +1149,43 @@ function AbracadabraScreen(): React.JSX.Element {
     }
   }, [scanOutcome]);
 
+  // Publish live session into the shared store so the Vault game tab can derive
+  // the same status and react to new recordings without owning the BLE radio.
+  const publishFacts = useSessionStore(s => s.publishFacts);
+  const publishRecording = useSessionStore(s => s.publishRecording);
+
+  useEffect(() => {
+    const facts: SessionFacts = {
+      bleState,
+      scanOutcome,
+      scanning,
+      hasTarget: targetDevice != null,
+      connPhase,
+      reconnectAttempt,
+      recvActive: recvProgress != null,
+      arming: wearableCaptureArming != null,
+      processingCapture,
+      showFreshConnected,
+    };
+    publishFacts(facts);
+  }, [
+    bleState,
+    scanOutcome,
+    scanning,
+    targetDevice,
+    connPhase,
+    reconnectAttempt,
+    recvProgress,
+    wearableCaptureArming,
+    processingCapture,
+    showFreshConnected,
+    publishFacts,
+  ]);
+
+  useEffect(() => {
+    publishRecording(lastRecording);
+  }, [lastRecording, publishRecording]);
+
   return (
     <Box
       flex={1}
@@ -1848,18 +1896,64 @@ function AbracadabraScreen(): React.JSX.Element {
 }
 
 const styles = StyleSheet.create({
+  root: {
+    flex: 1,
+  },
   scrollContent: {
     flexGrow: 1,
     paddingBottom: 36,
   },
 });
 
+const NAV_THEME = {
+  ...DarkTheme,
+  colors: {
+    ...DarkTheme.colors,
+    background: '#020617',
+    card: '#020617',
+    border: 'transparent',
+  },
+};
+
+const Tab = createBottomTabNavigator();
+
+const renderNeonTabBar = (props: BottomTabBarProps) => <NeonTabBar {...props} />;
+
 export default function App(): React.JSX.Element {
   return (
-    <SafeAreaProvider>
-      <GluestackUIProvider config={config} colorMode="dark">
-        <AbracadabraScreen />
-      </GluestackUIProvider>
-    </SafeAreaProvider>
+    <GestureHandlerRootView style={styles.root}>
+      <SafeAreaProvider>
+        <GluestackUIProvider config={config} colorMode="dark">
+          <StatusBar barStyle="light-content" backgroundColor="#020617" />
+          <NavigationContainer theme={NAV_THEME}>
+            {/*
+             * Training is the always-mounted BLE owner (lazy: false), so the
+             * radio connects and recordings flow even while the Vault tab is on
+             * top. The Vault is the default/main game screen.
+             */}
+            <Tab.Navigator
+              initialRouteName="Vault"
+              tabBar={renderNeonTabBar}
+              screenOptions={{headerShown: false, lazy: false}}>
+              <Tab.Screen
+                name="Vault"
+                component={VaultScreen}
+                options={{title: 'Vault'}}
+              />
+              <Tab.Screen
+                name="Training"
+                component={AbracadabraScreen}
+                options={{title: 'Training'}}
+              />
+              <Tab.Screen
+                name="Spellbook"
+                component={SpellbookScreen}
+                options={{title: 'Spellbook'}}
+              />
+            </Tab.Navigator>
+          </NavigationContainer>
+        </GluestackUIProvider>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
 }
