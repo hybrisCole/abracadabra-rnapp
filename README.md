@@ -4,7 +4,7 @@ This is a new [**React Native**](https://reactnative.dev) project, bootstrapped 
 
 What this repo is today:
 
-- **Stack:** React Native **0.85.x**, React **19.2.3** (keep this **exact** patch in sync with the Hermes renderer bundled in RN or you’ll hit a version-mismatch runtime error). TypeScript. **[Gluestack UI](https://gluestack.io/ui)** (`@gluestack-ui/themed` + `@gluestack-ui/config`) drives layout with **forced dark** styling and neon-accent cyberpunk visuals in `App.tsx`.
+- **Stack:** React Native **0.86.x**, React **19.2.3** (keep this **exact** patch in sync with the Hermes renderer bundled in RN or you’ll hit a version-mismatch runtime error). TypeScript. **[Gluestack UI](https://gluestack.io/ui)** (`@gluestack-ui/themed` + `@gluestack-ui/config`) drives layout with **forced dark** styling and neon-accent cyberpunk visuals in `App.tsx`.
 - **BLE transfer:** The wearable sends **framed NOTIFY** packets on **`ADAB0003`** (magic **`0xADAB`** LE, **`pkt`** byte, reserved byte, payload):
   - **`RECORDING_PENDING` (`pkt = 4`):** right after an **accepted** double-tap — payload **`window_id` u16 LE**, **`proto_ver` u8**, reserved — so the app can show **armed / recording** before onboard capture finishes.
   - **`META` (`pkt = 1`):** after capture — **`window_id`**, **`sample_count`**, **`total_bytes`**, **IEEE CRC-32** over the full packed buffer (see **`bleRecordingProtocol.ts`**).
@@ -22,6 +22,8 @@ This repo is set up for **iPhone** deployment; the React Native template still i
 ## App architecture — The Vault (game), Training, Spellbook
 
 > **Node:** every Node/npm/npx command in this repo must run under **Node 26**: `source ~/.nvm/nvm.sh && nvm use 26 && <cmd>`. A bare shell has no `node`/`npm` on PATH. This is also captured as an always-on rule in `.cursor/rules/nodejs-nvm.mdc`.
+>
+> **Troubleshooting:** launch crashes, Metro, signing, Hermes/`dyld` mismatches after RN upgrades → **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**.
 
 The app is a **react-navigation** bottom-tab shell with three screens. The wearable link is **inbound-only** (the phone never sends commands to the wearable), so every real-world effect runs on the phone.
 
@@ -125,7 +127,7 @@ This app uses [**react-native-ble-plx**](https://github.com/dotintent/react-nati
 
 - **iOS:** `ios/AbracadabraRnApp/Info.plist` includes `NSBluetoothAlwaysUsageDescription` and `NSBluetoothPeripheralUsageDescription`. After changing native deps: `cd ios && bundle exec pod install`.
 - **Flow:** Auto-scan for **`XA_Abracadabra`** → connect → discover → subscribe to **`ADAB0003-…`** on **`ADAB0001-…`**. On **RECORDING_PENDING**, arm UI / vibrate; on **META**, allocate the exact byte buffer; on **CHUNK**, fill by offset and update progress; on **COMMIT**, require complete byte coverage + CRC check + 14-byte LE decode before mounting charts. If notify chunks are incomplete, or chunk progress stalls and **COMMIT** never arrives, a watchdog triggers fallback pull of the same staged payload through **`ADAB0004`** / **`ADAB0005`** before rolling back. Failed transfers surface as rollback UI state.
-- **Reconnect:** After an unexpected disconnect, the app waits ~**1.8 s** and reconnects automatically (same peripheral id), up to **15** tries, then shows **Link Lost** until **Scan Again**.
+- **Reconnect:** After an unexpected disconnect, the app waits **5 s** and reconnects automatically (same peripheral id), up to **15** tries, then shows **Link Lost** until **Scan Again**. Failed connect attempts during that cycle retry on the same schedule.
 - **Why notify chunks on iOS:** CoreBluetooth does not give this app the same explicit MTU-control workflow as Android, and the previous pull model paid one write-with-response plus one read for each slice. Notify chunks reduce application round trips while staying inside the common iOS notify payload limit (**182 bytes**), using a small firmware-side pace delay, and preserving the exact same packed recording plus full-buffer CRC guarantee. This is a throughput optimization, not a sampling-quality change.
 - **Debug logs:** During development, Metro logs **`[BleRx]`** for notify META / CHUNK / COMMIT progress, **`[BlePull]`** for fallback write-offset/read-slice progress, and **`[recording]`** for app-level transfer/finalize state. If the UI sticks on **Processing**, these tags show whether it is waiting on notify chunks, fallback GATT pull, or CRC/decode.
 
@@ -170,7 +172,7 @@ npx react-native run-ios --device
 
 Or pick your device and press Run in Xcode while Metro is running.
 
-To open React Native DevTools, press **`j`** in the Metro terminal.
+To open React Native DevTools, press **`j`** in the Metro terminal. See **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** for launch crashes, Hermes mismatches, and device networking.
 
 ### Metro + nvm (`env: node: No such file or directory`)
 

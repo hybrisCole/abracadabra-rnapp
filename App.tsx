@@ -83,7 +83,7 @@ const GLITCH_HERO_TITLE =
   'X̴̢̢̘̪̬̯̘̓̓͒́̏ę̵̛͙͇͕̎̿́͋̍͊͆r̵̨̡̡̗̩̜͎̬̞̒̿̋̂̀̏̉͋̈́͠ͅc̵̲͔̺̠̦̹̞̳̊̎̅̑͗̓͐͗ȩ̵̧̞̭̩͉͔͙̻̄́͑̉̆̎͜͝s̴͇̰̠͕͎̈̇̄̀͌̊ ̶̼̯͛Ą̷̟̘̱͔̼̯̯̓͐̓͗̅̐̉͊̕͠ú̸̱̭̝͎̘͇͇̮̂͌͜ȑ̵̢̨͚͈͔̟̽̉̀͜ͅo̸̢͈͚̗͍̪̟̯̭͓̅̍́̋r̴̢̢̨̳̪̗͎͔͗͆͝ͅä̵̢̙́ ̷̢̲̜̱̊̔̄́ͅ-̸̟̪̲̼̝̳̫̻̐̈́̂̈́́͐ ̶̮̼̆̊̓̓̽A̴̼̯̍́͒͒̀͆̔̕͘͝b̵̰͕͕̣̏̍͑̌̅̉͊̒ͅr̷̗͉͈̥̓̀̾̽̿̂̒̿̏ā̸̡̛̖̱͉͇̹̥̇̉̎̈́ͅc̵͔͑͆̍̉̌͊͝͝a̵̢͙̮͎̤̳̻̘̒̽͑̾̍ḓ̴̣͉̯̝̍͆͒a̴̫̰͇͍͕̳͗͌̾̊̈b̴̡̤̞̪̊̍̉͠r̷̡̻̼͉̹̱͇̦̞̟̅̇a̸̟̼͛̉̽̇͑ͅ';
 
 /** Wait before retrying BLE connect after an unexpected peripheral disconnect. */
-const LINK_LOST_RETRY_DELAY_MS = 1800;
+const LINK_LOST_RETRY_DELAY_MS = 5000;
 /** After this many disconnect-driven retries without staying linked, show Link Lost. */
 const MAX_AUTO_RECONNECT_ROUNDS = 15;
 
@@ -144,6 +144,11 @@ type NotifyFallbackMeta = {
   crcExpected: number;
   receivedBytes: number;
   reason: string;
+  /**
+   * False while chunks stream live during capture (before META): totals/CRC are
+   * still estimates, so the GATT pull fallback cannot verify a download yet.
+   */
+  canPull: boolean;
 };
 
 const TRAINING_LABELS: {value: MovementType; label: string; helper: string}[] = [
@@ -349,6 +354,18 @@ function AbracadabraScreen(): React.JSX.Element {
       clearNotifyStreamWatchdog();
       notifyFallbackMetaRef.current = null;
       assemblerRef.current.reset('fallback pull starting');
+      if (!meta.canPull) {
+        // Stalled during live capture, before META delivered real totals/CRC —
+        // nothing to verify a pull against; surface the failure and rearm.
+        endRecvTransfer();
+        setProcessingCapture(false);
+        setWearableCaptureArming(null);
+        setTransferNote(
+          `Live stream ${meta.reason} at ${meta.receivedBytes} bytes before totals were known`,
+        );
+        transferInFlightRef.current = false;
+        return;
+      }
       const linkedDev = connectedDevRef.current;
       if (!linkedDev) {
         endRecvTransfer();
@@ -470,6 +487,32 @@ function AbracadabraScreen(): React.JSX.Element {
     [clearNotifyStreamWatchdog, recoverWithFallbackPull],
   );
 
+  /** Last capture window we pre-warmed for; RECORDING_PENDING repeats are deduped. */
+  const prewarmedWindowRef = useRef(0);
+
+  /**
+   * Fire-and-forget ping so DNS/TLS and the Railway container are warm by the
+   * time the recording lands and the Vault runs its analyze call.
+   */
+  const prewarmGestureApi = useCallback((windowId: number) => {
+    if (prewarmedWindowRef.current === windowId) {
+      return;
+    }
+    prewarmedWindowRef.current = windowId;
+    gestureApi
+      .getModelStatus()
+      .then(() => {
+        if (__DEV__) {
+          console.log('[prewarm] gesture API warm', {windowId});
+        }
+      })
+      .catch(error => {
+        if (__DEV__) {
+          console.warn('[prewarm] gesture API ping failed', formatErrorDetail(error));
+        }
+      });
+  }, []);
+
   useEffect(() => {
     const mgr = new BleManager();
     managerRef.current = mgr;
@@ -554,6 +597,7 @@ function AbracadabraScreen(): React.JSX.Element {
     clearNotifyStreamWatchdog();
     notifyFallbackMetaRef.current = null;
     transferInFlightRef.current = false;
+    prewarmedWindowRef.current = 0;
     assemblerRef.current.reset('scan again');
     autoReconnectRoundRef.current = 0;
     setReconnectAttempt(0);
@@ -726,6 +770,57 @@ function AbracadabraScreen(): React.JSX.Element {
             if (result.kind === 'recording_pending') {
               setWearableCaptureArming({windowId: result.windowId});
               Vibration.vibrate([0, 45]);
+              // Capture takes ~4 s — use that window to warm the analyze API
+              // (DNS + TLS + Railway container) so the post-capture call is fast.
+              prewarmGestureApi(result.windowId);
+              return;
+            }
+            if (result.kind === 'stream_started') {
+              // Firmware streams chunks live during the IMU window. Keep the
+              // "recording" status; receive UI starts at META (tail flush).
+              transferInFlightRef.current = true;
+              console.log('[recording] live stream started', {
+                windowId: result.windowId,
+                maxSamples: result.maxSamples,
+                maxTotalBytes: result.maxTotalBytes,
+              });
+              armNotifyStreamWatchdog(
+                {
+                  windowId: result.windowId,
+                  samples: result.maxSamples,
+                  totalBytes: result.maxTotalBytes,
+                  crcExpected: 0,
+                  receivedBytes: 0,
+                  reason: 'incomplete',
+                  canPull: false,
+                },
+                {force: true},
+              );
+              return;
+            }
+            if (result.kind === 'transfer_meta') {
+              // Capture finished; totals/CRC now authoritative and the packed
+              // buffer is staged on the peripheral, so the pull fallback works.
+              setWearableCaptureArming(null);
+              beginRecvTransfer(result.filled, result.totalBytes);
+              console.log('[recording] live stream totals', {
+                windowId: result.windowId,
+                samples: result.samples,
+                totalBytes: result.totalBytes,
+                filled: result.filled,
+              });
+              armNotifyStreamWatchdog(
+                {
+                  windowId: result.windowId,
+                  samples: result.samples,
+                  totalBytes: result.totalBytes,
+                  crcExpected: result.crcExpected,
+                  receivedBytes: result.filled,
+                  reason: 'incomplete',
+                  canPull: true,
+                },
+                {force: true},
+              );
               return;
             }
             if (result.kind === 'transfer_started') {
@@ -748,6 +843,7 @@ function AbracadabraScreen(): React.JSX.Element {
                   crcExpected: result.crcExpected,
                   receivedBytes: 0,
                   reason: 'incomplete',
+                  canPull: true,
                 },
                 {force: true},
               );
@@ -840,6 +936,8 @@ function AbracadabraScreen(): React.JSX.Element {
                 crcExpected: result.crcExpected,
                 receivedBytes: result.receivedBytes,
                 reason: 'incomplete',
+                // COMMIT delivered authoritative totals/CRC, so a pull can verify.
+                canPull: true,
               });
             } else if (result.kind === 'error') {
               clearNotifyStreamWatchdog();
@@ -865,7 +963,26 @@ function AbracadabraScreen(): React.JSX.Element {
           console.warn('[BLE connect]', formatErrorDetail(e), e);
         }
         if (!cancelled) {
-          setConnPhase('error');
+          // Initial connect after scan: surface error. During auto-reconnect, keep trying.
+          if (autoReconnectRoundRef.current === 0) {
+            setConnPhase('error');
+            return;
+          }
+          const nextRound = autoReconnectRoundRef.current + 1;
+          if (nextRound > MAX_AUTO_RECONNECT_ROUNDS) {
+            setConnPhase('error');
+            return;
+          }
+          autoReconnectRoundRef.current = nextRound;
+          setReconnectAttempt(nextRound);
+          setConnPhase('connecting');
+          if (reconnectTimerRef.current != null) {
+            clearTimeout(reconnectTimerRef.current);
+          }
+          reconnectTimerRef.current = setTimeout(() => {
+            reconnectTimerRef.current = null;
+            setLinkSession(s => s + 1);
+          }, LINK_LOST_RETRY_DELAY_MS);
         }
       }
     })();

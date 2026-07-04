@@ -37,6 +37,12 @@
 	<string>This app uses Bluetooth to connect to your Abracadabra wearable.</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
 	<string>This app uses Bluetooth to connect to your Abracadabra wearable.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>This app connects to the Metro bundler on your Mac during development.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_http._tcp.</string>
+	</array>
 	<key>RCTNewArchEnabled</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>

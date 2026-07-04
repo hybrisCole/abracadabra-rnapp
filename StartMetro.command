@@ -8,5 +8,5 @@ if [ -s "$NVM_DIR/nvm.sh" ]; then
   . "$NVM_DIR/nvm.sh"
 fi
 
-nvm use 25
+nvm use 26
 exec npm start

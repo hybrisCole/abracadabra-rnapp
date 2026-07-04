@@ -2,9 +2,13 @@
  * Abracadabra BLE recording transfer:
  * - ADAB0003 NOTIFY framed packets: magic 0xADAB LE, pkt byte, reserved, payload.
  * - RECORDING_PENDING (pkt 4): 4 B payload — window_id u16 LE, proto_ver u8 — sent when DT is accepted.
- * - META (pkt 1): window, sample count, total bytes, CRC-32 — after capture.
+ * - START (pkt 5): window_id u16, max_samples u16, sample_period_ms u8, proto u8, max_total_bytes u32 —
+ *   sent right before capture; CHUNKs then stream live *during* the IMU window.
  * - CHUNK (pkt 2): window_id u16, byte offset u32, data_len u16, then packed bytes.
+ * - META (pkt 1): window, sample count, total bytes, CRC-32 — after capture ends
+ *   (authoritative: early stop can shorten the window below max_total_bytes).
  * - COMMIT (pkt 3): window_id, total bytes, CRC-32; app accepts only after full CRC/decode.
+ * Older firmware sends META before any CHUNK; the assembler supports both orders.
  */
 
 import type {Device} from 'react-native-ble-plx';
@@ -41,12 +45,28 @@ export type FeedResult =
   | {kind: 'idle'}
   | {kind: 'recording_pending'; windowId: number}
   | {
+    kind: 'stream_started';
+    windowId: number;
+    maxSamples: number;
+    maxTotalBytes: number;
+    samplePeriodMs: number;
+    recvEpoch: number;
+  }
+  | {
     kind: 'transfer_started';
     windowId: number;
     samples: number;
     totalBytes: number;
     crcExpected: number;
     recvEpoch: number;
+  }
+  | {
+    kind: 'transfer_meta';
+    windowId: number;
+    samples: number;
+    totalBytes: number;
+    crcExpected: number;
+    filled: number;
   }
   | {kind: 'transfer_progress'; windowId: number; filled: number; total: number}
   | {
@@ -117,7 +137,10 @@ const PK_CHUNK = 2;
 const PK_COMMIT = 3;
 /** Firmware sends this immediately after an accepted double-tap, just before IMU capture. */
 const PK_RECORDING_PENDING = 4;
+/** Firmware sends this right before capture starts; CHUNKs then stream during the IMU window. */
+const PK_START = 5;
 const RECORDING_PENDING_PAYLOAD_LEN = 4;
+const START_PAYLOAD_LEN = 10;
 
 /** META framed payload after 4-byte header (matches firmware meta[16]). */
 const META_PAYLOAD_LEN = 16;
@@ -129,8 +152,11 @@ const MAX_PAYLOAD_BYTES = 24000;
 type NotifyTransferState = {
   windowId: number;
   samples: number;
+  /** Estimated (max) until metaSeen/COMMIT; early stop can shorten the real payload. */
   totalBytes: number;
   crcExpected: number;
+  /** True once META delivered the authoritative sample count / byte count / CRC. */
+  metaSeen: boolean;
   payload: Uint8Array;
   receivedMask: Uint8Array;
   receivedBytes: number;
@@ -324,6 +350,56 @@ export class RecordingAssembler {
       return {kind: 'recording_pending', windowId};
     }
 
+    if (pktType === PK_START) {
+      if (packet.byteLength < 4 + START_PAYLOAD_LEN) {
+        return {kind: 'error', message: 'START too short'};
+      }
+      const windowId = readU16Le(dv, 4);
+      const maxSamples = readU16Le(dv, 6);
+      const samplePeriodMs = packet[8];
+      const proto = packet[9];
+      const maxTotalBytes = readU32Le(dv, 10);
+      if (proto !== 1) {
+        return {kind: 'error', message: `START unsupported proto ${proto}`};
+      }
+      if (
+        maxTotalBytes === 0 ||
+        maxTotalBytes > MAX_PAYLOAD_BYTES ||
+        maxTotalBytes !== maxSamples * BLE_PACKED_SAMPLE_BYTES
+      ) {
+        return {kind: 'error', message: 'START invalid size'};
+      }
+
+      this.recvEpoch += 1;
+      this.notifyTransfer = {
+        windowId,
+        samples: maxSamples,
+        totalBytes: maxTotalBytes,
+        crcExpected: 0,
+        metaSeen: false,
+        payload: new Uint8Array(maxTotalBytes),
+        receivedMask: new Uint8Array(maxTotalBytes),
+        receivedBytes: 0,
+        nextLogBytes: Math.min(1024, maxTotalBytes),
+      };
+      logBleRx('START ok (live stream)', {
+        recvEpoch: this.recvEpoch,
+        windowId,
+        maxSamples,
+        maxTotalBytes,
+        samplePeriodMs,
+      });
+
+      return {
+        kind: 'stream_started',
+        windowId,
+        maxSamples,
+        maxTotalBytes,
+        samplePeriodMs,
+        recvEpoch: this.recvEpoch,
+      };
+    }
+
     if (pktType === PK_META) {
       logBleRx('frame', {
         pktType,
@@ -351,12 +427,42 @@ export class RecordingAssembler {
         return {kind: 'error', message: 'META invalid size'};
       }
 
+      const streaming = this.notifyTransfer;
+      if (streaming != null && streaming.windowId === win && !streaming.metaSeen) {
+        // Live-stream flow: META arrives after capture, once totals/CRC are known.
+        if (totalBytes > streaming.payload.byteLength) {
+          this.reset('META larger than START allocation');
+          return {kind: 'error', message: 'META exceeds START allocation'};
+        }
+        streaming.samples = samples;
+        streaming.totalBytes = totalBytes;
+        streaming.crcExpected = crcExpected;
+        streaming.metaSeen = true;
+        logBleRx('META ok (live stream totals)', {
+          windowId: win,
+          samples,
+          totalBytes,
+          crc: crcExpected.toString(16),
+          filled: streaming.receivedBytes,
+        });
+        return {
+          kind: 'transfer_meta',
+          windowId: win,
+          samples,
+          totalBytes,
+          crcExpected,
+          filled: streaming.receivedBytes,
+        };
+      }
+
+      // Legacy flow (META before any CHUNK) or a new window replacing a stale transfer.
       this.recvEpoch += 1;
       this.notifyTransfer = {
         windowId: win,
         samples,
         totalBytes,
         crcExpected,
+        metaSeen: true,
         payload: new Uint8Array(totalBytes),
         receivedMask: new Uint8Array(totalBytes),
         receivedBytes: 0,
@@ -403,7 +509,9 @@ export class RecordingAssembler {
       if (dataLen === 0 || dataEnd > packet.byteLength) {
         return {kind: 'error', message: 'CHUNK length mismatch'};
       }
-      if (offset + dataLen > transfer.totalBytes) {
+      // Bound by allocation, not totalBytes: during live streaming totalBytes is
+      // still the max estimate until META/COMMIT deliver the real count.
+      if (offset + dataLen > transfer.payload.byteLength) {
         return {kind: 'error', message: 'CHUNK offset out of range'};
       }
 
@@ -464,12 +572,29 @@ export class RecordingAssembler {
       if (proto !== 1) {
         return {kind: 'error', message: `COMMIT unsupported proto ${proto}`};
       }
-      if (
-        win !== transfer.windowId ||
-        totalBytes !== transfer.totalBytes ||
-        crcExpected !== transfer.crcExpected
-      ) {
+      if (win !== transfer.windowId) {
         return {kind: 'error', message: 'COMMIT metadata mismatch'};
+      }
+      if (transfer.metaSeen) {
+        if (
+          totalBytes !== transfer.totalBytes ||
+          crcExpected !== transfer.crcExpected
+        ) {
+          return {kind: 'error', message: 'COMMIT metadata mismatch'};
+        }
+      } else {
+        // META notify was lost; COMMIT totals are equally authoritative.
+        if (
+          totalBytes === 0 ||
+          totalBytes > transfer.payload.byteLength ||
+          totalBytes % BLE_PACKED_SAMPLE_BYTES !== 0
+        ) {
+          return {kind: 'error', message: 'COMMIT invalid size'};
+        }
+        transfer.totalBytes = totalBytes;
+        transfer.crcExpected = crcExpected;
+        transfer.samples = totalBytes / BLE_PACKED_SAMPLE_BYTES;
+        transfer.metaSeen = true;
       }
       if (transfer.receivedBytes !== transfer.totalBytes) {
         logBleRx('COMMIT incomplete', {
@@ -491,7 +616,8 @@ export class RecordingAssembler {
         };
       }
 
-      const payload = transfer.payload;
+      // Live streaming allocates at max size; expose only the committed range.
+      const payload = transfer.payload.subarray(0, totalBytes);
       this.notifyTransfer = null;
       logBleRx('COMMIT ok (notify chunks)', {
         windowId: win,
