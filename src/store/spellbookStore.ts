@@ -97,7 +97,31 @@ export const useSpellbookStore = create<SpellbookStore>()(
     }),
     {
       name: 'abracadabra-spellbook-v1',
+      version: 1,
       storage: createJSONStorage(createSpellStorage),
+      migrate: (persisted, version) => {
+        const state = persisted as {spells?: Spell[]};
+        if (version >= 1 || state.spells == null) {
+          return persisted as SpellbookStore;
+        }
+        return {
+          ...state,
+          spells: state.spells.map(spell => {
+            const legacy = spell.action as UnlockAction | {type: 'notify'; title: string};
+            if (legacy.type !== 'notify') {
+              return spell;
+            }
+            return {
+              ...spell,
+              action: {
+                type: 'call' as const,
+                phone: '',
+                contactName: legacy.title,
+              },
+            };
+          }),
+        };
+      },
     },
   ),
 );

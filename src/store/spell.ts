@@ -15,7 +15,7 @@ export type UnlockAction =
       headers?: Record<string, string>;
       body?: string;
     }
-  | {type: 'notify'; title: string; body?: string};
+  | {type: 'call'; phone: string; contactName?: string};
 
 /** A saved combination → action mapping (the "spellbook" entry). */
 export type Spell = {
@@ -35,8 +35,10 @@ export function describeAction(action: UnlockAction): string {
       return `SMS to ${action.phone}`;
     case 'http':
       return `${action.method} ${action.url}`;
-    case 'notify':
-      return `Notify: ${action.title}`;
+    case 'call':
+      return action.contactName
+        ? `Call ${action.contactName} (${action.phone})`
+        : `Call ${action.phone}`;
     default:
       return 'Unknown action';
   }

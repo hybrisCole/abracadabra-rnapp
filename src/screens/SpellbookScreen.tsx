@@ -1,5 +1,5 @@
-import React, {useEffect, useMemo, useState} from 'react';
-import {ScrollView, StyleSheet} from 'react-native';
+import React, {useCallback, useEffect, useMemo, useState} from 'react';
+import {Alert, ScrollView, StyleSheet} from 'react-native';
 import {useRoute} from '@react-navigation/native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {
@@ -13,6 +13,7 @@ import {
 } from '@gluestack-ui/themed';
 
 import type {PasswordMovementType} from '../../gestureApi';
+import {pickPhoneContact, type PickedPhoneContact} from '../actions/pickPhoneContact';
 import {describeAction, formatSequence, type UnlockAction} from '../store/spell';
 import {useSpellbookStore} from '../store/spellbookStore';
 import {NeonButton, ButtonText, NeonPressable} from '../ui';
@@ -23,14 +24,13 @@ const ACTION_TYPES: {value: ActionType; label: string}[] = [
   {value: 'open_url', label: 'Open URL'},
   {value: 'sms', label: 'SMS'},
   {value: 'http', label: 'Webhook'},
-  {value: 'notify', label: 'Notify'},
+  {value: 'call', label: 'Call'},
 ];
 
-const PRIMARY_PLACEHOLDER: Record<ActionType, string> = {
+const PRIMARY_PLACEHOLDER: Record<Exclude<ActionType, 'call'>, string> = {
   open_url: 'https://youtube.com/…',
   sms: '+15551234567',
   http: 'https://homeassistant.local/api/…',
-  notify: 'Spell title',
 };
 
 function buildAction(
@@ -38,6 +38,7 @@ function buildAction(
   primary: string,
   secondary: string,
   method: 'GET' | 'POST',
+  callContact: PickedPhoneContact | null,
 ): UnlockAction {
   switch (type) {
     case 'open_url':
@@ -50,8 +51,15 @@ function buildAction(
       };
     case 'http':
       return {type, method, url: primary.trim()};
-    case 'notify':
-      return {type, title: primary.trim(), body: secondary.trim() || undefined};
+    case 'call':
+      if (callContact == null || callContact.phone.trim().length === 0) {
+        throw new Error('Call spell requires a contact with a phone number');
+      }
+      return {
+        type,
+        phone: callContact.phone,
+        contactName: callContact.name || undefined,
+      };
   }
 }
 
@@ -73,6 +81,8 @@ export function SpellbookScreen(): React.JSX.Element {
   const [primary, setPrimary] = useState('');
   const [secondary, setSecondary] = useState('');
   const [method, setMethod] = useState<'GET' | 'POST'>('POST');
+  const [callContact, setCallContact] = useState<PickedPhoneContact | null>(null);
+  const [pickingContact, setPickingContact] = useState(false);
   const [sequence, setSequence] = useState<PasswordMovementType[]>(prefill);
 
   useEffect(() => {
@@ -82,7 +92,30 @@ export function SpellbookScreen(): React.JSX.Element {
   }, [prefill]);
 
   const canSave =
-    name.trim().length > 0 && primary.trim().length > 0 && sequence.length > 0;
+    name.trim().length > 0 &&
+    sequence.length > 0 &&
+    (actionType === 'call'
+      ? (callContact?.phone.trim().length ?? 0) > 0
+      : primary.trim().length > 0);
+
+  const onPickContact = useCallback(async () => {
+    if (pickingContact) {
+      return;
+    }
+    setPickingContact(true);
+    try {
+      const contact = await pickPhoneContact();
+      if (contact != null) {
+        setCallContact(contact);
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Could not open contacts';
+      Alert.alert('Choose contact', message);
+    } finally {
+      setPickingContact(false);
+    }
+  }, [pickingContact]);
 
   const onSave = () => {
     if (!canSave) {
@@ -91,11 +124,12 @@ export function SpellbookScreen(): React.JSX.Element {
     addSpell({
       name: name.trim(),
       sequence,
-      action: buildAction(actionType, primary, secondary, method),
+      action: buildAction(actionType, primary, secondary, method, callContact),
     });
     setName('');
     setPrimary('');
     setSecondary('');
+    setCallContact(null);
   };
 
   return (
@@ -170,7 +204,12 @@ export function SpellbookScreen(): React.JSX.Element {
                 return (
                   <NeonPressable
                     key={option.value}
-                    onPress={() => setActionType(option.value)}>
+                    onPress={() => {
+                      setActionType(option.value);
+                      if (option.value !== 'call') {
+                        setCallContact(null);
+                      }
+                    }}>
                     <Box
                       px="$3"
                       py="$2"
@@ -217,22 +256,57 @@ export function SpellbookScreen(): React.JSX.Element {
               </HStack>
             ) : null}
 
-            <Input
-              mt="$3"
-              borderRadius="$xl"
-              borderColor="rgba(148,163,184,0.35)"
-              bg="rgba(2,6,23,0.6)">
-              <InputField
-                color="#e0f2fe"
-                placeholder={PRIMARY_PLACEHOLDER[actionType]}
-                placeholderTextColor="#475569"
-                autoCapitalize="none"
-                value={primary}
-                onChangeText={setPrimary}
-              />
-            </Input>
-
-            {actionType === 'sms' || actionType === 'notify' ? (
+            {actionType === 'call' ? (
+              <VStack mt="$3" space="sm">
+                {callContact != null ? (
+                  <Box
+                    p="$3"
+                    borderRadius="$xl"
+                    borderWidth={1}
+                    borderColor="rgba(34,211,238,0.35)"
+                    bg="rgba(2,6,23,0.55)">
+                    <Text color="#e0f2fe" fontWeight="$bold" fontSize="$sm">
+                      {callContact.name || 'Contact'}
+                    </Text>
+                    <Text
+                      mt="$1"
+                      color="#94a3b8"
+                      fontFamily="Menlo"
+                      fontSize="$xs">
+                      {callContact.phone}
+                    </Text>
+                  </Box>
+                ) : (
+                  <Text color="#64748b" fontFamily="Menlo" fontSize="$xs">
+                    Pick someone from your address book to dial when this spell
+                    fires.
+                  </Text>
+                )}
+                <NeonButton
+                  borderRadius="$xl"
+                  bg="rgba(8,47,73,0.85)"
+                  borderWidth={1}
+                  borderColor="rgba(34,211,238,0.45)"
+                  isDisabled={pickingContact}
+                  opacity={pickingContact ? 0.6 : 1}
+                  onPress={() => {
+                    void onPickContact();
+                  }}>
+                  <ButtonText
+                    color="#67e8f9"
+                    fontWeight="$extrabold"
+                    letterSpacing="$md"
+                    fontSize="$sm"
+                    textTransform="uppercase">
+                    {pickingContact
+                      ? 'Opening contacts…'
+                      : callContact != null
+                        ? 'Change contact'
+                        : 'Choose contact'}
+                  </ButtonText>
+                </NeonButton>
+              </VStack>
+            ) : (
               <Input
                 mt="$3"
                 borderRadius="$xl"
@@ -240,7 +314,24 @@ export function SpellbookScreen(): React.JSX.Element {
                 bg="rgba(2,6,23,0.6)">
                 <InputField
                   color="#e0f2fe"
-                  placeholder={actionType === 'sms' ? 'Message body (optional)' : 'Body (optional)'}
+                  placeholder={PRIMARY_PLACEHOLDER[actionType]}
+                  placeholderTextColor="#475569"
+                  autoCapitalize="none"
+                  value={primary}
+                  onChangeText={setPrimary}
+                />
+              </Input>
+            )}
+
+            {actionType === 'sms' ? (
+              <Input
+                mt="$3"
+                borderRadius="$xl"
+                borderColor="rgba(148,163,184,0.35)"
+                bg="rgba(2,6,23,0.6)">
+                <InputField
+                  color="#e0f2fe"
+                  placeholder="Message body (optional)"
                   placeholderTextColor="#475569"
                   value={secondary}
                   onChangeText={setSecondary}

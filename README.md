@@ -84,7 +84,7 @@ Because BLE is inbound-only, a matched spell triggers a **phone-side** `UnlockAc
 - **`open_url`** — `Linking.openURL` (deep links / websites, e.g. YouTube).
 - **`sms`** — opens the iOS Messages composer (`sms:`); iOS requires the user to tap send.
 - **`http`** — `fetch` GET/POST to a webhook (Home Assistant, IFTTT, smart locks/lights) — the universal "do something physical" action.
-- **`notify`** — app-side message surfaced in the HUD.
+- **`call`** — opens the Phone app to dial a contact chosen via the system contact picker when binding the spell.
 
 ### Spellbook — `src/screens/SpellbookScreen.tsx`
 

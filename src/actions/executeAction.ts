@@ -4,6 +4,15 @@ import type {UnlockAction} from '../store/spell';
 
 export type ActionResult = {ok: boolean; message: string};
 
+/** Strip formatting for tel: while preserving a leading country code. */
+function phoneForTelUri(phone: string): string {
+  const trimmed = phone.trim();
+  if (trimmed.startsWith('+')) {
+    return `+${trimmed.slice(1).replace(/\D/g, '')}`;
+  }
+  return trimmed.replace(/\D/g, '');
+}
+
 /**
  * Perform the real-world effect for a matched spell. BLE is inbound-only, so
  * every effect runs on the phone:
@@ -12,7 +21,7 @@ export type ActionResult = {ok: boolean; message: string};
  *              silently send an SMS)
  *  - http:     fetch to a webhook / smart-home endpoint (lights, vault, IFTTT,
  *              Home Assistant) — the universal "do anything physical" action
- *  - notify:   app-side message surfaced in the HUD
+ *  - call:     opens the Phone app to dial a contact chosen in the Spellbook
  */
 export async function executeAction(action: UnlockAction): Promise<ActionResult> {
   try {
@@ -43,8 +52,19 @@ export async function executeAction(action: UnlockAction): Promise<ActionResult>
         }
         return {ok: true, message: `Triggered ${action.url}`};
       }
-      case 'notify': {
-        return {ok: true, message: action.title};
+      case 'call': {
+        const tel = phoneForTelUri(action.phone);
+        if (tel.length === 0) {
+          return {ok: false, message: 'Spell has no phone number'};
+        }
+        const url = `tel:${tel}`;
+        const canOpen = await Linking.canOpenURL(url);
+        if (!canOpen) {
+          return {ok: false, message: 'Cannot open the Phone app'};
+        }
+        await Linking.openURL(url);
+        const who = action.contactName ?? action.phone;
+        return {ok: true, message: `Calling ${who}`};
       }
       default: {
         return {ok: false, message: 'Unknown action'};
